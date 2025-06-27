@@ -69,4 +69,7 @@ node_modules/
 .dataconnect
 
 # seeds
-functions/seed.js
+**/seed*
+
+# credential
+**/saf-e-locker*

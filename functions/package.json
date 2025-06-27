@@ -14,9 +14,10 @@
   },
   "main": "index.js",
   "dependencies": {
+    "crypto": "latest",
     "firebase-admin": "^12.6.0",
     "firebase-functions": "^6.0.1",
-    "crypto": "latest"
+    "midtrans-client": "^1.4.3"
   },
   "devDependencies": {
     "eslint": "^8.15.0",
