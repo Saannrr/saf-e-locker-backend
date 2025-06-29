@@ -19,6 +19,10 @@ const { getFirestore, FieldValue, Timestamp } = require("firebase-admin/firestor
 const crypto = require("crypto");
 const logger = require("firebase-functions/logger");
 const midtransClient = require("midtrans-client");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { getMessaging } = require("firebase-admin/messaging");
+const { getAuth } = require("firebase-admin/auth");
+const nodemailer = require("nodemailer");
 
 // Inisialisasi Firebase Admin SDK
 initializeApp();
@@ -26,6 +30,8 @@ initializeApp();
 // Inisialisasi Snap API dari Midtrans
 const MIDTRANS_SERVER_KEY = defineString("MIDTRANS_SERVER_KEY");
 const MIDTRANS_CLIENT_KEY = defineString("MIDTRANS_CLIENT_KEY");
+const SENDER_EMAIL = defineString("SENDER_EMAIL");
+const SENDER_PASSWORD = defineString("SENDER_PASSWORD");
 
 const snap = new midtransClient.Snap({
     isProduction: false,
@@ -37,18 +43,24 @@ const snap = new midtransClient.Snap({
 const aesKey = defineString("AES_KEY");
 const aesIv = defineString("AES_IV");
 const ALGORITHM = "aes-256-cbc";
+const db = getFirestore();
 
 // --- BAGIAN HELPER FUNCTIONS ---
 
 /**
- * Generates a unique Midtrans order ID.
- * @param {string} rentalId The rental ID.
- * @param {string} paymentType The payment type ('initial_fee' or 'fine').
- * @return {string} Unique order ID.
+ * Membuat Order ID unik untuk Midtrans.
+ * FUNGSI INI TELAH DIPERBAIKI untuk memastikan panjang tidak melebihi 50 karakter.
+ * @param {string} rentalId - ID dari dokumen rental.
+ * @param {string} paymentType - Jenis pembayaran ('initial_fee', 'fine', dll).
+ * @return {string} Order ID yang unik dan aman.
  */
 function generateMidtransOrderId(rentalId, paymentType) {
     const timestamp = Date.now();
-    return `${rentalId}_${paymentType}_${timestamp}`;
+    // Midtrans memiliki batas maksimal 50 karakter untuk order_id.
+    // Untuk memastikan tidak melebihi batas, kita potong bagian rentalId.
+    // 20 (rentalId) + 13 (paymentType terpanjang) + 13 (timestamp) + 2 (underscore) = 48 karakter. Aman!
+    const truncatedRentalId = rentalId.substring(0, 20);
+    return `${truncatedRentalId}_${paymentType}_${timestamp}`;
 }
 
 /**
@@ -113,7 +125,371 @@ function decrypt(encryptedHex) {
     }
 }
 
+/**
+ * Helper function internal untuk membuat entri log.
+ * Tidak bisa dipanggil langsung dari klien.
+ * @param {object} logData Data log yang akan disimpan.
+ */
+async function createLogEntry(logData) {
+    try {
+        // Menambahkan data log ke koleksi 'logs' dengan ID acak
+        await db.collection("logs").add(logData);
+        logger.info("Log entry created:", logData.details);
+    } catch (error) {
+        logger.error("Failed to create log entry:", error);
+        // Kita tidak melempar error di sini agar aksi utama tidak gagal
+        // hanya karena logging gagal. Tapi kita mencatatnya.
+    }
+}
+
+// Fungsi untuk memvalidasi format email
+// eslint-disable-next-line require-jsdoc
+function isValidEmail(email) {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
+}
+
+// --- BAGIAN API UNTUK FRONTEND ---
+
+/**
+ * (API untuk User) - Memulai proses sewa dengan mencari loker yang tersedia,
+ * mereservasinya, dan membuat dokumen rental. Ini adalah langkah pertama
+ * sebelum melakukan pembayaran.
+ * Memerlukan data: { durationInHours: number }
+ */
+exports.initiateRental = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi pengguna sudah login
+    if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Anda harus login untuk memulai sewa.");
+    }
+    const userId = request.auth.uid;
+
+    // 2. Validasi input
+    const { durationInHours } = request.data;
+    if (!durationInHours || typeof durationInHours !== "number" || durationInHours <= 0) {
+        throw new HttpsError("invalid-argument", "Durasi sewa (durationInHours) harus angka positif.");
+    }
+
+    // 3. Gunakan Transaksi Firestore untuk keamanan dan konsistensi
+    try {
+        const rentalId = await db.runTransaction(async (t) => {
+            // Cari satu loker yang statusnya 'available'
+            const lockersRef = db.collection("lockers");
+            const availableLockerQuery = lockersRef.where("status", "==", "available").limit(1);
+            const lockerSnapshot = await t.get(availableLockerQuery);
+
+            if (lockerSnapshot.empty) {
+                // Tidak ada loker tersedia, lempar error yang akan ditangkap oleh klien
+                throw new HttpsError("not-found", "Maaf, tidak ada loker yang tersedia saat ini.");
+            }
+
+            const lockerDoc = lockerSnapshot.docs[0];
+            const lockerId = lockerDoc.id;
+            const lockerRef = lockerDoc.ref;
+
+            // Hitung biaya dan waktu di server (lebih aman)
+            const hourlyRate = 5000; // Definisikan harga per jam di sini
+            const initialCost = durationInHours * hourlyRate;
+            const startTime = new Date();
+            const expectedEndTime = new Date(startTime.getTime() + durationInHours * 60 * 60 * 1000);
+
+            // Buat dokumen rental baru
+            const rentalRef = db.collection("rentals").doc(); // Buat ID baru
+            t.set(rentalRef, {
+                user_id: userId,
+                locker_id: lockerId,
+                start_time: Timestamp.fromDate(startTime),
+                duration_hours: durationInHours,
+                status: "pending_payment", // Status awal sebelum dibayar
+                payment_status: "unpaid",
+                expected_end_time: Timestamp.fromDate(expectedEndTime),
+                initial_cost: initialCost,
+                fine_amount: 0,
+            });
+
+            logger.info(`Loker ${lockerId} telah direservasi untuk rental ${rentalRef.id}.`);
+
+            // Kembalikan ID rental yang baru dibuat
+            return rentalRef.id;
+        });
+
+        // Jika transaksi berhasil, kirim kembali rentalId ke klien
+        return {
+            success: true,
+            rentalId: rentalId,
+            message: "Loker berhasil direservasi. Silakan lanjutkan ke pembayaran."
+        };
+    } catch (error) {
+        logger.error("Gagal memulai proses sewa:", error);
+        // Jika error sudah HttpsError (seperti 'not-found'), lemparkan kembali.
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        // Untuk error lainnya, kirim pesan generik.
+        throw new HttpsError("internal", "Terjadi kesalahan saat mencoba menyewa loker.");
+    }
+});
+
+/**
+ * (API untuk User) - Meminta pembukaan loker dengan langsung mengubah field 'isLocked'.
+ * Ini adalah pendekatan yang lebih sederhana.
+ * Memerlukan data: { rentalId: string }
+ */
+exports.openLockerByApp = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi pengguna sudah login
+    if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Anda harus login untuk melakukan aksi ini.");
+    }
+    const userId = request.auth.uid;
+
+    // 2. Validasi input
+    const { rentalId } = request.data;
+    if (!rentalId) {
+        throw new HttpsError("invalid-argument", "Parameter 'rentalId' diperlukan.");
+    }
+
+    const db = getFirestore();
+
+    try {
+        // 3. Gunakan Transaksi Firestore untuk keamanan
+        await db.runTransaction(async (t) => {
+            const rentalRef = db.collection("rentals").doc(rentalId);
+            const rentalDoc = await t.get(rentalRef);
+
+            if (!rentalDoc.exists) {
+                throw new HttpsError("not-found", "Data sewa tidak ditemukan.");
+            }
+            const rentalData = rentalDoc.data();
+
+            // Verifikasi kepemilikan dan status sewa (logika ini sudah benar)
+            if (rentalData.user_id !== userId) {
+                throw new HttpsError("permission-denied", "Anda tidak memiliki izin untuk loker ini.");
+            }
+            if (!["active", "pending_retrieval"].includes(rentalData.status)) {
+                throw new HttpsError(
+                    "failed-precondition",
+                    `Loker tidak dapat dibuka saat status sewa adalah '${rentalData.status}'.`
+                );
+            }
+
+            // Dapatkan referensi loker
+            const lockerId = rentalData.locker_id;
+            const lockerRef = db.collection("lockers").doc(lockerId);
+
+            // --- INI ADALAH LOGIKA UTAMA (DIRECT TRIGGER) ---
+            // Langsung perintahkan loker untuk membuka dengan mengubah 'isLocked' menjadi false.
+            logger.info(`Pengguna ${userId} mengirim perintah buka ke loker ${lockerId}`);
+            t.update(lockerRef, {
+                isLocked: false,
+                last_lock_change: Timestamp.now(),
+            });
+            // ---------------------------------------------
+        });
+
+        // 4. Kirim respons sukses ke aplikasi
+        return {
+            success: true,
+            message: "Perintah untuk membuka loker telah dikirim."
+        };
+    } catch (error) {
+        logger.error("Gagal meminta pembukaan loker:", error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * (API untuk User) - Dipanggil oleh aplikasi saat pengguna menekan tombol "Terminate"
+ * untuk menyelesaikan sesi sewa mereka.
+ * Memerlukan data: { rentalId: string }
+ */
+exports.terminateRentalByUser = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi pengguna sudah login
+    if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Anda harus login untuk melakukan aksi ini.");
+    }
+    const userId = request.auth.uid;
+
+    // 2. Validasi input
+    const { rentalId } = request.data;
+    if (!rentalId) {
+        throw new HttpsError("invalid-argument", "Parameter 'rentalId' diperlukan.");
+    }
+
+    const db = getFirestore();
+    const rentalRef = db.collection("rentals").doc(rentalId);
+
+    try {
+        // 3. Gunakan Transaksi Firestore untuk keamanan dan konsistensi
+        await db.runTransaction(async (t) => {
+            const rentalDoc = await t.get(rentalRef);
+
+            if (!rentalDoc.exists) {
+                throw new HttpsError("not-found", "Data sewa tidak ditemukan.");
+            }
+            const rentalData = rentalDoc.data();
+
+            // Verifikasi kepemilikan
+            if (rentalData.user_id !== userId) {
+                throw new HttpsError("permission-denied", "Anda tidak memiliki izin untuk mengakhiri sewa ini.");
+            }
+
+            // --- LOGIKA PENGAMAN PENTING ---
+            // Pastikan sewa hanya bisa diakhiri jika statusnya 'active'.
+            // Ini mencegah pengguna mengakhiri sewa yang sudah selesai atau terkunci.
+            if (rentalData.status !== "active") {
+                throw new HttpsError(
+                    "failed-precondition",
+                    `Sewa tidak dapat diakhiri karena statusnya adalah '${rentalData.status}', bukan 'active'.`
+                );
+            }
+
+            // 4. Lakukan update: ubah status menjadi 'finished'.
+            // Perubahan ini akan secara otomatis memicu 'calculateFineOnFinish'.
+            logger.info(`Pengguna ${userId} mengakhiri sewa ${rentalId}. Memicu proses penyelesaian...`);
+            t.update(rentalRef, {
+                actual_end_time: Timestamp.now(), // Catat waktu selesai sebenarnya
+                status: "finished",
+            });
+        });
+
+        // 5. Kirim respons sukses ke aplikasi
+        return {
+            success: true,
+            message: "Permintaan untuk mengakhiri sewa telah diterima dan sedang diproses."
+        };
+    } catch (error) {
+        logger.error(`Gagal mengakhiri sewa ${rentalId}:`, error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
 // --- BAGIAN CLOUD FUNCTIONS ---
+
+/**
+ * (Scheduled Trigger) - Berjalan setiap 30 menit untuk membersihkan
+ * dokumen rental dan pembayaran yang "terbengkalai" (status pending).
+ */
+exports.cleanupPendingTransactions = onSchedule("every 30 minutes", async (event) => {
+    logger.info("Menjalankan tugas terjadwal: Membersihkan transaksi pending yang terbengkalai...");
+
+    const db = getFirestore();
+
+    // Tentukan batas waktu. Dokumen yang dibuat sebelum waktu ini akan dianggap terbengkalai.
+    // Kita set 30 menit yang lalu untuk memberikan cukup waktu bagi pengguna menyelesaikan pembayaran.
+    const cutoffTime = new Date(Date.now() - 30 * 60 * 1000);
+    const cutoffTimestamp = Timestamp.fromDate(cutoffTime);
+
+    // Kita akan query koleksi 'payments' karena itu adalah titik awal dari sebuah transaksi.
+    const paymentsRef = db.collection("payments");
+    const query = paymentsRef
+        .where("status", "==", "pending")
+        .where("created_at", "<=", cutoffTimestamp);
+
+    try {
+        const snapshot = await query.get();
+        if (snapshot.empty) {
+            logger.info("Tidak ada transaksi pending yang terbengkalai ditemukan.");
+            return null;
+        }
+
+        logger.warn(`Ditemukan ${snapshot.size} transaksi pending yang akan dibersihkan.`);
+
+        // Gunakan Batch Write untuk melakukan beberapa operasi sekaligus secara efisien.
+        const batch = db.batch();
+
+        snapshot.forEach((doc) => {
+            const paymentData = doc.data();
+            const rentalId = paymentData.rental_id;
+
+            logger.info(`- Menyiapkan pembersihan untuk payment: ${doc.id} dan rental: ${rentalId}`);
+
+            // 1. Hapus dokumen pembayaran yang pending.
+            batch.delete(doc.ref);
+
+            // 2. Update status dokumen rental terkait menjadi 'cancelled'.
+            // Ini lebih baik daripada menghapus, agar ada jejak riwayat.
+            if (rentalId) {
+                const rentalRef = db.collection("rentals").doc(rentalId);
+                batch.update(rentalRef, {
+                    status: "cancelled_unpaid",
+                    payment_status: "expired"
+                });
+            }
+        });
+
+        // Jalankan semua operasi dalam batch.
+        await batch.commit();
+        logger.info(`Berhasil membersihkan ${snapshot.size} transaksi yang terbengkalai.`);
+    } catch (error) {
+        logger.error("Error saat membersihkan transaksi pending:", error);
+    }
+
+    return null;
+});
+
+/**
+ * (Scheduled Trigger) - Berjalan setiap 1 menit untuk secara otomatis
+ * menyelesaikan sewa yang statusnya 'pending_retrieval' terlalu lama.
+ * Ini untuk kasus di mana pengguna sudah bayar denda dan mengambil barang,
+ * tetapi lupa menekan tombol "Selesaikan Sewa".
+ */
+exports.autoFinishAbandonedRetrievals = onSchedule("every 1 minutes", async (event) => {
+    logger.info("Menjalankan tugas terjadwal: Menyelesaikan sewa 'pending_retrieval' yang terlantar...");
+
+    // Tentukan batas waktu. Sewa yang masuk ke status 'pending_retrieval'
+    // sebelum waktu ini akan dianggap terlantar. Kita beri waktu 5 menit.
+    const cutoffTime = new Date(Date.now() - 5 * 60 * 1000);
+    const cutoffTimestamp = Timestamp.fromDate(cutoffTime);
+
+    // Query untuk mencari semua dokumen rental yang memenuhi kriteria:
+    // 1. Statusnya adalah 'pending_retrieval'.
+    // 2. Waktu terakhir di-update (saat menjadi 'pending_retrieval') sudah lebih dari 30 menit yang lalu.
+    const rentalsRef = db.collection("rentals");
+    const query = rentalsRef
+        .where("status", "==", "pending_retrieval")
+        .where("updated_at", "<=", cutoffTimestamp);
+
+    try {
+        const snapshot = await query.get();
+        if (snapshot.empty) {
+            logger.info("Tidak ada sewa 'pending_retrieval' yang terlantar ditemukan.");
+            return null; // Tidak ada yang perlu dilakukan, keluar dari fungsi.
+        }
+
+        logger.warn(`Ditemukan ${snapshot.size} sewa terlantar yang akan diselesaikan secara otomatis.`);
+
+        // Kumpulkan semua promise update ke dalam sebuah array.
+        const promises = [];
+        snapshot.forEach((doc) => {
+            const rentalId = doc.id;
+            logger.info(`- Menyiapkan penyelesaian otomatis untuk rental ${rentalId}...`);
+
+            // Aksi yang kita lakukan adalah mengubah statusnya menjadi 'finished'.
+            // Perubahan ini akan secara otomatis memicu fungsi 'onRentalEnd'
+            // untuk melakukan pembersihan loker (menghapus PIN, mengubah status loker, dll).
+            const updatePromise = doc.ref.update({
+                status: "finished",
+                // Opsional: Tambahkan catatan bahwa ini diselesaikan oleh sistem.
+                notes: "Sewa diselesaikan secara otomatis oleh sistem karena tidak aktif."
+            });
+            promises.push(updatePromise);
+        });
+
+        // Jalankan semua update secara bersamaan.
+        await Promise.all(promises);
+        logger.info(`Berhasil menyelesaikan ${snapshot.size} sewa yang terlantar.`);
+    } catch (error) {
+        logger.error("Error saat menjalankan tugas pembersihan 'pending_retrieval':", error);
+    }
+
+    return null;
+});
 
 /**
  * Fungsi yang dipanggil Flutter untuk membuat transaksi pembayaran.
@@ -127,20 +503,26 @@ exports.createTransaction = onCall({ enforceAppCheck: false }, async (request) =
     const userId = request.auth.uid;
     const userEmail = request.auth.token.email;
     const userName = request.auth.token.name || "User";
-    const { rentalId, amount, paymentType } = request.data;
+    // 'amount' dari request sekarang hanya digunakan untuk 'extension_fee'.
+    const { rentalId, paymentType, extensionInHours } = request.data;
+    const amountFromRequest = request.data.amount;
 
+    // Validasi paymentType
+    if (!paymentType || !["initial_fee", "fine", "extension_fee"].includes(paymentType)) {
+        throw new HttpsError("invalid-argument", "Parameter paymentType tidak valid.");
+    }
+
+    // Validasi extensionInHours untuk extension_fee
+    if (paymentType === "extension_fee" && (!extensionInHours || typeof extensionInHours !== "number" || extensionInHours <= 0)) {
+        throw new HttpsError("invalid-argument", "Untuk perpanjangan, 'extensionInHours' harus angka positif.");
+    }
+
+    // Validasi rentalId
     if (!rentalId || typeof rentalId !== "string") {
         logger.error("createTransaction: Missing or invalid rentalId.");
         throw new HttpsError("invalid-argument", "Parameter rentalId diperlukan dan harus string.");
     }
-    if (!amount || typeof amount !== "number" || amount <= 0) {
-        logger.error("createTransaction: Missing or invalid amount.");
-        throw new HttpsError("invalid-argument", "Parameter amount diperlukan dan harus angka positif.");
-    }
-    if (!paymentType || !["initial_fee", "fine"].includes(paymentType)) {
-        logger.error("createTransaction: Missing or invalid paymentType.");
-        throw new HttpsError("invalid-argument", "Parameter paymentType harus 'initial_fee' atau 'fine'.");
-    }
+
     if (!userEmail) {
         logger.error("createTransaction: User email not available.");
         throw new HttpsError("invalid-argument", "Email pengguna diperlukan.");
@@ -154,8 +536,36 @@ exports.createTransaction = onCall({ enforceAppCheck: false }, async (request) =
         throw new HttpsError("permission-denied", "Rental tidak ditemukan atau Anda tidak memiliki akses.");
     }
 
-    // --- PERBAIKAN LOGIKA UTAMA ---
-    // Pengecekan ketersediaan loker HANYA dilakukan untuk sewa awal.
+    const rentalData = rentalDoc.data();
+
+    // --- KOREKSI LOGIKA UTAMA DI SINI ---
+    let transactionAmount;
+
+    if (paymentType === "initial_fee") {
+        // Untuk sewa awal, ambil biaya dari dokumen rental yang sudah dibuat oleh initiateRental.
+        if (!rentalData.initial_cost || rentalData.initial_cost <= 0) {
+            throw new HttpsError("failed-precondition", "Biaya sewa awal tidak valid pada data rental.");
+        }
+        transactionAmount = rentalData.initial_cost;
+        logger.info(`Membuat transaksi sewa awal untuk rental ${rentalId} sebesar Rp${transactionAmount} (diambil dari server).`);
+    } else if (paymentType === "extension_fee") {
+        // --- KOREKSI DI SINI ---
+        // Gunakan variabel 'amountFromRequest' yang sudah kita deklarasikan.
+        if (!amountFromRequest || typeof amountFromRequest !== "number" || amountFromRequest <= 0) {
+            throw new HttpsError("invalid-argument", "Parameter 'amount' diperlukan dan harus angka positif untuk perpanjangan.");
+        }
+        transactionAmount = amountFromRequest;
+        // --- AKHIR KOREKSI ---
+    } else if (paymentType === "fine") {
+        // Untuk denda, ambil dari Firestore.
+        if (!rentalData.fine_amount || rentalData.fine_amount <= 0) {
+            throw new HttpsError("failed-precondition", "Tidak ada denda yang perlu dibayar untuk sewa ini.");
+        }
+        transactionAmount = rentalData.fine_amount;
+    }
+    // --- AKHIR KOREKSI ---
+
+    // Pengecekan ketersediaan loker hanya untuk initial_fee
     if (paymentType === "initial_fee") {
         const lockerId = rentalDoc.data().locker_id;
         const lockerRef = db.collection("lockers").doc(lockerId);
@@ -169,7 +579,7 @@ exports.createTransaction = onCall({ enforceAppCheck: false }, async (request) =
     const parameter = {
         transaction_details: {
             order_id: midtransOrderId,
-            gross_amount: amount,
+            gross_amount: transactionAmount,
         },
         customer_details: {
             first_name: userName,
@@ -185,17 +595,23 @@ exports.createTransaction = onCall({ enforceAppCheck: false }, async (request) =
         logger.info(`Transaction token created for order ${midtransOrderId}: ${transactionToken}`);
 
         const paymentRef = db.collection("payments").doc(midtransOrderId);
-        await paymentRef.set({
+        const paymentPayload = {
             rental_id: rentalId,
             user_id: userId,
             midtrans_order_id: midtransOrderId,
-            amount: amount,
+            amount: transactionAmount,
             payment_type: paymentType,
             status: "pending",
             created_at: Timestamp.now(),
             updated_at: Timestamp.now(),
             response_data: transaction,
-        });
+        };
+
+        if (paymentType === "extension_fee") {
+            paymentPayload.extension_in_hours = extensionInHours;
+        }
+
+        await paymentRef.set(paymentPayload);
 
         return { token: transactionToken, orderId: midtransOrderId };
     } catch (error) {
@@ -209,154 +625,6 @@ exports.createTransaction = onCall({ enforceAppCheck: false }, async (request) =
 
 /**
  * Fungsi yang menerima notifikasi dari Midtrans.
- */
-// exports.midtransNotificationHandler = onRequest(async (request, response) => {
-//     const notificationJson = request.body;
-//     logger.info(`Menerima notifikasi dari Midtrans: ${JSON.stringify(notificationJson)}`);
-
-//     try {
-//         // --- Langkah 1: Validasi Input Dasar & Signature Key ---
-//         const { order_id, status_code, gross_amount, signature_key, transaction_status } = notificationJson;
-
-//         // Validasi apakah notifikasi memiliki data minimal yang dibutuhkan
-//         if (!order_id || !status_code || !gross_amount || !signature_key || !transaction_status) {
-//             logger.warn("Notifikasi tidak lengkap dari Midtrans.", notificationJson);
-//             // Memberi respon 200 agar Midtrans tidak mengirim ulang notifikasi yang rusak.
-//             return response.status(200).json({ message: "Incomplete notification received." });
-//         }
-
-//         const serverKey = MIDTRANS_SERVER_KEY.value(); // Pastikan menggunakan .value()
-
-//         const expectedSignature = crypto.createHash("sha512")
-//             .update(`${order_id}${status_code}${gross_amount}${serverKey}`)
-//             .digest("hex");
-
-//         if (signature_key !== expectedSignature) {
-//             logger.error(`Signature tidak valid untuk order_id: ${order_id}.`);
-//             return response.status(403).json({ error: "Forbidden. Invalid signature." });
-//         }
-
-//         // --- Langkah 2: Verifikasi Status Transaksi ke API Midtrans (Lapisan Keamanan Kedua) ---
-//         logger.info(`Signature valid. Memverifikasi status transaksi untuk order_id: ${order_id}`);
-//         // Kita gunakan nama variabel yang berbeda untuk menghindari konflik
-//         const midtransStatusResponse = await snap.transaction.notification(notificationJson);
-//         const { fraud_status, transaction_id, payment_type: paymentMethod } = midtransStatusResponse;
-
-//         // transaction_status kita ambil dari notifikasi awal karena sudah divalidasi signature-nya
-//         logger.info(`Notifikasi terverifikasi untuk order ${order_id}: status=${transaction_status}, fraud=${fraud_status}`);
-
-//         // --- Langkah 3: Proses Logika Bisnis (Update Firestore) ---
-//         const db = getFirestore();
-//         const paymentRef = db.collection("payments").doc(order_id);
-
-//         // Gunakan Transaksi Firestore untuk memastikan konsistensi data
-//         await db.runTransaction(async (t) => {
-//             const paymentDoc = await t.get(paymentRef);
-//             if (!paymentDoc.exists) {
-//                 // Jika dokumen pembayaran tidak ada, kita tidak bisa melanjutkan.
-//                 // Ini bisa terjadi jika notifikasi datang sebelum dokumen dibuat.
-//                 // Sebaiknya log sebagai error dan hentikan proses.
-//                 throw new Error(`Payment document with order_id: ${order_id} not found.`);
-//             }
-
-//             const paymentData = paymentDoc.data();
-//             const rentalRef = db.collection("rentals").doc(paymentData.rental_id);
-//             const rentalDoc = await t.get(rentalRef);
-//             if (!rentalDoc.exists) {
-//                 throw new Error(`Rental document with id: ${paymentData.rental_id} not found.`);
-//             }
-
-//             const lockerId = rentalDoc.data().locker_id;
-//             const lockerRef = db.collection("lockers").doc(lockerId);
-
-//             // Menentukan status pembayaran internal kita
-//             let paymentStatus;
-//             if (transaction_status === "capture" || transaction_status === "settlement") {
-//                 paymentStatus = fraud_status === "accept" ? "success" : "failed";
-//             } else if (["deny", "cancel", "expire"].includes(transaction_status)) {
-//                 paymentStatus = transaction_status === "deny" ? "failed" : transaction_status;
-//             } else {
-//                 paymentStatus = transaction_status; // pending, refund, dll.
-//             }
-
-//             // Update dokumen pembayaran
-//             t.update(paymentRef, {
-//                 status: paymentStatus,
-//                 midtrans_transaction_id: transaction_id,
-//                 payment_method: paymentMethod,
-//                 updated_at: Timestamp.now(),
-//                 response_data: midtransStatusResponse,
-//             });
-
-//             // Update dokumen rental dan loker jika pembayaran sukses atau gagal
-//             if (paymentStatus === "success") {
-//                 // Periksa TIPE pembayaran dari data di Firestore
-//                 const paymentType = paymentData.payment_type;
-
-//                 if (paymentType === "initial_fee") {
-//                     // --- LOGIKA UNTUK SEWA AWAL ---
-//                     logger.info(`Pembayaran sewa awal untuk rental ${paymentData.rental_id} berhasil.`);
-//                     t.update(rentalRef, {
-//                         payment_status: "paid",
-//                         status: "active",
-//                         updated_at: Timestamp.now(),
-//                     });
-//                     t.update(lockerRef, {
-//                         status: "occupied",
-//                         current_rental_id: paymentData.rental_id,
-//                         last_updated: Timestamp.now(),
-//                     });
-//                 } else if (paymentType === "fine") {
-//                     // --- LOGIKA UNTUK PEMBAYARAN DENDA ---
-//                     logger.info(`Pembayaran denda untuk rental ${paymentData.rental_id} berhasil. Membuat PIN sementara...`);
-
-//                     const temporaryPin = Math.floor(1000 + Math.random() * 9000).toString();
-//                     const encryptedTemporaryPin = encrypt(temporaryPin);
-
-//                     t.update(rentalRef, {
-//                         payment_status: "fine_paid",
-//                         status: "pending_retrieval",
-//                         encrypted_pin: encryptedTemporaryPin,
-//                         updated_at: Timestamp.now(),
-//                     });
-
-//                     t.update(lockerRef, {
-//                         active_pin: temporaryPin,
-//                         last_updated: Timestamp.now(),
-//                     });
-//                 }
-//             } else if (["failed", "expired", "cancelled"].includes(paymentStatus)) {
-//                 const currentLockerDoc = await t.get(lockerRef);
-//                 // Hanya reset loker jika loker tersebut masih terasosiasi dengan rental ini
-//                 if (currentLockerDoc.exists && currentLockerDoc.data().current_rental_id === paymentData.rental_id) {
-//                     t.update(rentalRef, {
-//                         payment_status: paymentStatus,
-//                         status: "cancelled",
-//                         updated_at: Timestamp.now(),
-//                     });
-//                     t.update(lockerRef, {
-//                         status: "available",
-//                         current_rental_id: null,
-//                         last_updated: Timestamp.now(),
-//                     });
-//                 }
-//             }
-//         });
-
-//         logger.info(`Payment ${order_id} berhasil diproses dengan status: ${paymentStatus}`);
-//         return response.status(200).json({ message: "Notification processed successfully." });
-//     } catch (error) {
-//         logger.error(`Gagal memproses notifikasi Midtrans: ${error.message}`, {
-//             errorDetails: error,
-//             requestBody: notificationJson,
-//         });
-//         // Kirim respon 500 agar Midtrans mencoba mengirim notifikasi lagi nanti (jika error bersifat sementara)
-//         return response.status(500).json({ error: "Gagal memproses notifikasi", details: error.message });
-//     }
-// });
-
-/**
- * fungsi midtransNotificationHandler dari Gemini (kalo ga works ganti aja pake fungsi yg lama)
  */
 exports.midtransNotificationHandler = onRequest(async (request, response) => {
     const notificationJson = request.body;
@@ -424,10 +692,58 @@ exports.midtransNotificationHandler = onRequest(async (request, response) => {
                     t.update(lockerRef, { status: "occupied", current_rental_id: paymentData.rental_id, last_updated: Timestamp.now() });
                 } else if (paymentType === "fine" && rentalData.status === "locked_due_to_fine") {
                     logger.info(`Pembayaran denda untuk rental ${paymentData.rental_id} berhasil. Membuat PIN sementara...`);
+
                     const temporaryPin = Math.floor(1000 + Math.random() * 9000).toString();
                     const encryptedTemporaryPin = encrypt(temporaryPin);
-                    t.update(rentalRef, { payment_status: "fine_paid", status: "pending_retrieval", encrypted_pin: encryptedTemporaryPin, updated_at: Timestamp.now() });
-                    t.update(lockerRef, { active_pin: temporaryPin, last_updated: Timestamp.now() });
+                    const fiveMinutesLater = new Date(Date.now() + 5 * 60 * 1000);
+
+                    // Update dokumen rental (ini sudah benar)
+                    t.update(rentalRef, {
+                        payment_status: "fine_paid",
+                        status: "pending_retrieval",
+                        encrypted_pin: encryptedTemporaryPin,
+                        updated_at: Timestamp.now()
+                    });
+
+                    // --- KOREKSI DI SINI ---
+                    // Update dokumen loker, sekarang dengan menambahkan kembali current_rental_id
+                    t.update(lockerRef, {
+                        active_pin: temporaryPin,
+                        last_updated: Timestamp.now(),
+                        status: "occupied", // Pastikan statusnya kembali 'occupied'
+                        current_rental_id: paymentData.rental_id, // Ambil rental_id dari data pembayaran
+                        pin_expiry: fiveMinutesLater,
+                    });
+                } else if (paymentType === "extension_fee" && rentalData.status === "active") {
+                    logger.info(`Pembayaran perpanjangan untuk rental ${paymentData.rental_id} berhasil. Memperpanjang waktu...`);
+
+                    // Ambil jumlah jam perpanjangan dari dokumen 'payments'.
+                    const extensionInHours = paymentData.extension_in_hours;
+                    if (!extensionInHours) {
+                        throw new Error("Data 'extension_in_hours' tidak ditemukan pada dokumen pembayaran.");
+                    }
+
+                    // Ambil waktu selesai saat ini.
+                    const currentEndTime = rentalData.expected_end_time.toDate();
+
+                    // Hitung waktu selesai yang baru.
+                    const extensionInMillis = extensionInHours * 60 * 60 * 1000;
+                    const newEndTime = new Date(currentEndTime.getTime() + extensionInMillis);
+
+                    // Update dokumen rental dengan waktu selesai yang baru.
+                    t.update(rentalRef, {
+                        expected_end_time: Timestamp.fromDate(newEndTime),
+                        payment_status: "paid", // Set kembali ke 'paid' jika ada status lain
+                        updated_at: Timestamp.now(),
+                    });
+
+                    // PENTING: Update juga pin_expiry di dokumen loker agar konsisten.
+                    t.update(lockerRef, {
+                        pin_expiry: Timestamp.fromDate(newEndTime),
+                        last_updated: Timestamp.now(),
+                    });
+
+                    logger.info(`Waktu sewa untuk rental ${paymentData.rental_id} berhasil diperpanjang hingga ${newEndTime.toISOString()}`);
                 } else {
                     logger.warn(`Menerima notifikasi sukses untuk rental ${paymentData.rental_id} yang statusnya sudah '${rentalData.status}'. Notifikasi diabaikan untuk mencegah race condition.`);
                 }
@@ -448,104 +764,6 @@ exports.midtransNotificationHandler = onRequest(async (request, response) => {
 /**
  * (API untuk Hardware) - Mengupdate status kunci loker dan memvalidasi PIN.
  * Versi ini menggabungkan semua logika keamanan dan alur penyelesaian sewa.
- */
-// exports.updateLockerStatus = onRequest(async (request, response) => {
-//     // --- BAGIAN 1: VALIDASI INPUT DASAR ---
-//     // Logika ini sudah benar. Memastikan semua parameter yang dibutuhkan
-//     // dari ESP32 telah dikirim.
-//     const { esp32_id, locker_id, isLocked, input_pin } = request.body;
-
-//     if (!esp32_id || !locker_id || isLocked === undefined) {
-//         logger.error("updateLockerStatus: Parameter yang dibutuhkan tidak lengkap.");
-//         return response.status(400).send("Parameter esp32_id, locker_id, dan isLocked diperlukan.");
-//     }
-
-//     // Mengambil referensi ke dokumen loker di Firestore.
-//     const lockerRef = db.collection("lockers").doc(locker_id);
-
-//     try {
-//         // Menggunakan Transaksi Firestore untuk memastikan semua operasi
-//         // (baca dan tulis) terjadi secara konsisten.
-//         await db.runTransaction(async (t) => {
-//             // --- BAGIAN 2: VALIDASI LOKER & PERANGKAT ---
-//             // Logika ini sudah benar. Memastikan loker ada dan
-//             // request datang dari ESP32 yang sah.
-//             const lockerDoc = await t.get(lockerRef);
-//             if (!lockerDoc.exists) {
-//                 throw new Error("Locker tidak ditemukan.");
-//             }
-
-//             const lockerData = lockerDoc.data();
-//             if (lockerData.esp32_id !== esp32_id) {
-//                 throw new Error("Akses ditolak: ESP32 ID tidak cocok.");
-//             }
-
-//             // --- BAGIAN 3: LOGIKA UTAMA SAAT ADA INPUT PIN ---
-//             // Blok ini hanya berjalan jika ESP32 mengirimkan PIN,
-//             // yang berarti ada percobaan untuk membuka loker.
-//             if (input_pin) {
-//                 // KOREKSI: Mengambil data rental terkait. Ini sudah benar.
-//                 const rentalId = lockerData.current_rental_id;
-//                 if (!rentalId) {
-//                     throw new Error("Loker tidak dalam masa sewa aktif untuk validasi PIN.");
-//                 }
-
-//                 const rentalRef = db.collection("rentals").doc(rentalId);
-//                 const rentalDoc = await t.get(rentalRef);
-//                 if (!rentalDoc.exists) {
-//                     throw new Error("Data rental terkait tidak ditemukan.");
-//                 }
-//                 const rentalData = rentalDoc.data();
-
-//                 // KOREKSI: Pengecekan status denda. Logika ini penting dan sudah benar.
-//                 // Ini harus dilakukan SEBELUM validasi PIN.
-//                 if (rentalData.status === "locked_due_to_fine") {
-//                     throw new Error("Akses ditolak. Harap selesaikan pembayaran denda.");
-//                 }
-
-//                 // KOREKSI: Validasi PIN. Ini adalah satu-satunya tempat kita perlu
-//                 // memeriksa PIN. Pengecekan PIN ganda yang ada di kode Anda sebelumnya
-//                 // telah dihapus untuk efisiensi.
-//                 if (lockerData.active_pin !== input_pin) {
-//                     throw new Error("PIN salah.");
-//                 }
-
-//                 // --- LOGIKA BARU YANG DITAMBAHKAN ---
-//                 // Setelah PIN dipastikan benar, kita cek apakah ini adalah
-//                 // akses terakhir untuk mengambil barang setelah bayar denda.
-//                 if (rentalData.status === "pending_retrieval") {
-//                     logger.info(`Akses terakhir untuk rental ${rentalId}. Menyelesaikan sewa...`);
-//                     // Jika ya, ubah status rental menjadi 'finished'.
-//                     // Perubahan ini akan secara otomatis memicu fungsi 'onRentalEnd'
-//                     // untuk membersihkan data loker.
-//                     t.update(rentalRef, {
-//                         status: "finished",
-//                         actual_end_time: Timestamp.now() // Catat waktu selesai sebenarnya
-//                     });
-//                 }
-//             }
-
-//             // --- BAGIAN 4: UPDATE STATUS KUNCI LOKER ---
-//             // Logika ini sudah benar. Ini akan selalu berjalan untuk melaporkan
-//             // status terakhir dari kunci loker (terkunci/terbuka) yang dikirim oleh ESP32.
-//             t.update(lockerRef, {
-//                 isLocked: isLocked,
-//                 last_lock_change: Timestamp.now(),
-//                 last_updated: Timestamp.now(),
-//             });
-//         });
-
-//         // Jika transaksi berhasil, kirim respons sukses.
-//         response.status(200).send("Locker status updated successfully.");
-//     } catch (error) {
-//         // Jika ada error di dalam transaksi, tangkap dan kirim sebagai respons error.
-//         logger.error(`Gagal update status locker ${locker_id}: ${error.message}`);
-//         response.status(400).send(error.message);
-//     }
-// });
-
-/**
- * fungsi updateLockerStatus dari Gemini (kalo ga works ganti aja pake fungsi yg lama)
  */
 exports.updateLockerStatus = onRequest(async (request, response) => {
     const { esp32_id, locker_id, isLocked, input_pin } = request.body;
@@ -718,73 +936,75 @@ exports.getDecryptedPin = onCall({ enforceAppCheck: false }, async (request) => 
 });
 
 /**
- * Terpicu saat dokumen rental selesai.
+ * (Scheduled Trigger) - Berjalan setiap menit untuk memeriksa PIN sementara yang kedaluwarsa.
  */
-// exports.onRentalEnd = onDocumentUpdated("rentals/{rentalId}", async (event) => {
-//     const afterData = event.data.after.data();
-//     const beforeData = event.data.before.data();
-//     const rentalId = event.params.rentalId;
-//     const db = getFirestore();
-//     const rentalRef = db.collection("rentals").doc(rentalId);
+exports.checkExpiredPins = onSchedule("every 1 minutes", async (event) => {
+    logger.info("Menjalankan tugas terjadwal: Memeriksa PIN yang kedaluwarsa...");
 
-//     if (beforeData.status !== "finished" && afterData.status === "finished") {
-//         const lockerId = afterData.locker_id;
-//         if (!lockerId) {
-//             logger.error(`onRentalEnd: locker_id missing.`);
-//             throw new HttpsError("invalid-argument", "Locker ID is required.");
-//         }
+    const now = Timestamp.now();
+    const lockersRef = db.collection("lockers");
 
-//         const lockerRef = db.collection("lockers").doc(lockerId);
-//         try {
-//             await db.runTransaction(async (transaction) => {
-//                 transaction.update(lockerRef, {
-//                     active_pin: null,
-//                     pin_expiry: null,
-//                     status: "available",
-//                     current_rental_id: null,
-//                     last_lock_change: null,
-//                     last_updated: Timestamp.now(),
-//                 });
-//                 transaction.update(rentalRef, {
-//                     encrypted_pin: null,
-//                     actual_end_time: Timestamp.now(),
-//                     updated_at: Timestamp.now(),
-//                 });
-//             });
-//             logger.info(`Locker ${lockerId}: PIN cleared for rental ${rentalId}.`);
-//         } catch (err) {
-//             logger.error(`Gagal menghapus PIN untuk locker ${lockerId}: ${err.message}`);
-//             throw new HttpsError("internal", err.message);
-//         }
-//     } else {
-//         logger.info(`No action needed for rental ${rentalId}.`);
-//     }
-// });
+    // Query untuk mencari semua loker yang memiliki pin_expiry dan sudah terlewat.
+    const query = lockersRef.where("pin_expiry", "<=", now);
+
+    try {
+        const snapshot = await query.get();
+        if (snapshot.empty) {
+            logger.info("Tidak ada PIN yang kedaluwarsa ditemukan.");
+            return null;
+        }
+
+        const promises = [];
+        snapshot.forEach((doc) => {
+            const lockerId = doc.id;
+            const lockerData = doc.data();
+            const rentalId = lockerData.current_rental_id;
+
+            logger.warn(`PIN untuk loker ${lockerId} (rental: ${rentalId}) telah kedaluwarsa! Menonaktifkan akses...`);
+
+            // Siapkan update untuk menonaktifkan PIN di loker
+            const lockerUpdatePromise = doc.ref.update({
+                active_pin: null,
+                pin_expiry: null // Hapus expiry setelah diproses
+            });
+            promises.push(lockerUpdatePromise);
+
+            // Siapkan update untuk mengembalikan status rental ke 'locked_due_to_fine'
+            if (rentalId) {
+                const rentalRef = db.collection("rentals").doc(rentalId);
+                const rentalUpdatePromise = rentalRef.update({
+                    encrypted_pin: null, // Hapus PIN dari rental juga
+                });
+                promises.push(rentalUpdatePromise);
+            }
+        });
+
+        await Promise.all(promises);
+        logger.info(`Berhasil memproses ${snapshot.size} PIN yang kedaluwarsa.`);
+    } catch (error) {
+        logger.error("Error saat memeriksa PIN yang kedaluwarsa:", error);
+    }
+    return null;
+});
 
 /**
- * fungsi onRentalEnd dari Gemini (kalo ga works ganti aja pake fungsi yg lama)
+ * Terpicu saat dokumen rental selesai.
  */
 exports.onRentalEnd = onDocumentUpdated("rentals/{rentalId}", async (event) => {
     const afterData = event.data.after.data();
     const beforeData = event.data.before.data();
 
-    // --- KONDISI YANG SUDAH DIPERBAIKI ---
-    // Kita hanya perlu memeriksa apakah statusnya berubah menjadi 'finished'.
-    // Ini akan menangani kasus selesai tepat waktu (fine_amount=0)
-    // dan kasus selesai setelah bayar denda (fine_amount > 0).
-    if (beforeData.status !== "finished" && afterData.status === "finished") {
+    // --- KONDISI 1: SEWA SELESAI TEPAT WAKTU ---
+    // Ini berjalan jika pengguna menyelesaikan sewa (active -> finished) DAN
+    // fungsi calculateFineOnFinish menentukan tidak ada denda (fine_amount: 0).
+    if (beforeData.status === "active" && afterData.status === "finished" && afterData.fine_amount === 0) {
+        logger.info(`Rental ${event.params.rentalId} selesai tepat waktu. Mereset loker...`);
+
         const lockerId = afterData.locker_id;
-        if (!lockerId) {
-            logger.error(`onRentalEnd: locker_id tidak ditemukan untuk rental ${event.params.rentalId}.`);
-            return;
-        }
-
-        logger.info(`Rental ${event.params.rentalId} telah selesai. Membersihkan dan mereset loker ${lockerId}...`);
-
-        const db = getFirestore();
+        if (!lockerId) { return; }
         const lockerRef = db.collection("lockers").doc(lockerId);
 
-        // Lakukan pembersihan: reset status loker, hapus PIN, dan hapus rental terkait.
+        // Lakukan reset total: loker menjadi tersedia untuk pengguna lain.
         await lockerRef.update({
             status: "available",
             active_pin: null,
@@ -793,69 +1013,136 @@ exports.onRentalEnd = onDocumentUpdated("rentals/{rentalId}", async (event) => {
             last_updated: Timestamp.now(),
         });
 
-        logger.info(`Loker ${lockerId} berhasil direset dan kini tersedia.`);
+        // --- KOREKSI DI SINI ---
+        // Hapus encrypted_pin HANYA di dalam kondisi ini.
+        await event.data.after.ref.update({ encrypted_pin: null });
+        logger.info(`Loker ${lockerId} berhasil direset.`);
+    }
+    // --- KONDISI 2: SELESAI SETELAH MENGAMBIL BARANG (PASCA-DENDA) ---
+    // Ini berjalan jika pengguna membuka loker dengan PIN sementara, yang mengubah
+    // status dari 'pending_retrieval' menjadi 'finished'.
+    else if (beforeData.status === "pending_retrieval" && afterData.status === "finished") {
+        logger.info(`Rental ${event.params.rentalId} selesai setelah pengambilan barang. Mereset loker...`);
 
-        // Opsional: Anda juga bisa menghapus field 'encrypted_pin' dari dokumen rental
-        // untuk kebersihan data, meskipun lokernya sudah tidak bisa dibuka.
-        await event.data.after.ref.update({
-            encrypted_pin: null,
-            actual_end_time: Timestamp.now(),
+        const lockerId = afterData.locker_id;
+        if (!lockerId) { return; }
+        const lockerRef = db.collection("lockers").doc(lockerId);
+
+        // Lakukan reset total yang sama.
+        await lockerRef.update({
+            status: "available",
+            active_pin: null,
+            pin_expiry: null,
+            current_rental_id: null,
+            last_updated: Timestamp.now(),
         });
+
+        // --- KOREKSI DI SINI ---
+        // Hapus encrypted_pin HANYA di dalam kondisi ini juga.
+        await event.data.after.ref.update({ encrypted_pin: null });
+        logger.info(`Loker ${lockerId} berhasil direset.`);
     }
 });
 
 /**
- * Terpicu saat dokumen rental di-update.
- * Bertugas menghitung denda DAN MENONAKTIFKAN PIN jika terlambat.
+ * (Scheduled Trigger - "Polisi Denda")
+ * Berjalan setiap 5 menit untuk secara otomatis menerapkan denda pada sewa yang kedaluwarsa.
+ * FUNGSI INI SEKARANG MENJADI OTORITAS UTAMA UNTUK PENERAPAN DENDA.
+ */
+exports.checkExpiredRentals = onSchedule("every 1 minutes", async (event) => {
+    logger.info("Menjalankan tugas terjadwal: Memeriksa sewa yang kedaluwarsa...");
+
+    const db = getFirestore();
+    const now = Timestamp.now();
+    const rentalsRef = db.collection("rentals");
+
+    // Query untuk mencari semua dokumen rental yang aktif dan sudah melewati expected_end_time.
+    const query = rentalsRef
+        .where("status", "==", "active")
+        .where("expected_end_time", "<=", now);
+
+    try {
+        const snapshot = await query.get();
+        if (snapshot.empty) {
+            logger.info("Tidak ada sewa aktif yang kedaluwarsa ditemukan.");
+            return null;
+        }
+
+        logger.warn(`Ditemukan ${snapshot.size} sewa kedaluwarsa yang akan diproses.`);
+
+        const promises = [];
+        snapshot.forEach((doc) => {
+            const rentalData = doc.data();
+            const rentalId = doc.id;
+
+            // --- LOGIKA DARI 'calculateFineOnFinish' DIPINDAHKAN KE SINI ---
+            const initialCost = rentalData.initial_cost;
+            if (initialCost === undefined || typeof initialCost !== "number") {
+                logger.error(`Rental ${rentalId} tidak memiliki 'initial_cost' yang valid. Melewati...`);
+                return; // Lanjut ke dokumen berikutnya
+            }
+
+            const calculatedFine = 1.5 * initialCost; // Atau 1.5 * initialCost sesuai aturan Anda
+            logger.info(`Rental ${rentalId} kedaluwarsa. Menerapkan denda: ${calculatedFine} dan menonaktifkan PIN...`);
+
+            const lockerRef = db.collection("lockers").doc(rentalData.locker_id);
+
+            // Siapkan update untuk rental dan loker dalam satu batch per dokumen
+            const rentalUpdatePromise = doc.ref.update({
+                fine_amount: calculatedFine,
+                payment_status: "unpaid_fine",
+                status: "locked_due_to_fine",
+                actual_end_time: now,
+                notes: "Denda diterapkan secara otomatis oleh sistem."
+            });
+
+            const lockerUpdatePromise = lockerRef.update({
+                active_pin: null
+            });
+
+            promises.push(rentalUpdatePromise, lockerUpdatePromise);
+            // --- AKHIR LOGIKA YANG DIPINDAHKAN ---
+        });
+
+        // Jalankan semua update secara bersamaan.
+        await Promise.all(promises);
+        logger.info(`Berhasil memproses ${snapshot.size} sewa yang kedaluwarsa.`);
+    } catch (error) {
+        logger.error("Error saat menjalankan tugas pemeriksaan sewa kedaluwarsa:", error);
+    }
+
+    return null;
+});
+
+/**
+ * (Background Trigger - "Petugas Selesai Tepat Waktu")
+ * Terpicu saat pengguna menekan "Selesaikan Sewa".
+ * TUGASNYA SEKARANG JAUH LEBIH SEDERHANA.
  */
 exports.calculateFineOnFinish = onDocumentUpdated("rentals/{rentalId}", async (event) => {
     const afterData = event.data.after.data();
     const beforeData = event.data.before.data();
 
+    // Kondisi pemicu tetap sama: hanya berjalan saat pengguna secara manual
+    // mengubah status dari 'active' menjadi 'finished'.
     if (beforeData.status === "active" && afterData.status === "finished") {
-        if (!afterData.expected_end_time || !afterData.actual_end_time) {
-            logger.error(`Rental ${event.params.rentalId} tidak memiliki data waktu yang lengkap.`);
-            return null;
-        }
-
+        // Karena scheduler sudah menangani kasus terlambat, kita bisa asumsikan
+        // jika fungsi ini berjalan, pengguna pasti tepat waktu.
+        // Pengecekan waktu di sini menjadi lapisan pengaman kedua (best practice).
         const expectedEndTime = afterData.expected_end_time.toDate();
         const actualEndTime = afterData.actual_end_time.toDate();
 
-        if (actualEndTime >= expectedEndTime) {
-            const initialCost = afterData.initial_cost;
-            if (initialCost === undefined || typeof initialCost !== "number") {
-                logger.error(`Rental ${event.params.rentalId} tidak memiliki 'initial_cost' yang valid.`);
-                return null;
-            }
-
-            const calculatedFine = 1.5 * initialCost;
-            logger.info(`Rental ${event.params.rentalId} terlambat. Denda: ${calculatedFine}. Menonaktifkan PIN...`);
-
-            // Dapatkan referensi ke dokumen loker
-            const db = getFirestore();
-            const lockerId = afterData.locker_id;
-            const lockerRef = db.collection("lockers").doc(lockerId);
-
-            // Jalankan kedua update secara bersamaan
-            const updateRentalPromise = event.data.after.ref.update({
-                fine_amount: calculatedFine,
-                payment_status: "unpaid_fine",
-                status: "locked_due_to_fine" // Status baru yang lebih deskriptif
-            });
-
-            const updateLockerPromise = lockerRef.update({
-                active_pin: null // <-- KUNCI DARI SOLUSI INI: HAPUS PIN AKTIF
-            });
-
-            // Tunggu kedua proses update selesai
-            return Promise.all([updateRentalPromise, updateLockerPromise]);
+        if (actualEndTime < expectedEndTime) {
+            // Pengguna selesai tepat waktu.
+            logger.info(`Rental ${event.params.rentalId} selesai tepat waktu. Tidak ada denda.`);
+            // Cukup set denda menjadi 0. Perubahan ini akan memicu onRentalEnd.
+            await event.data.after.ref.update({ fine_amount: 0 });
         } else {
-            logger.info(`Rental ${event.params.rentalId} selesai tepat waktu.`);
-            return event.data.after.ref.update({ fine_amount: 0 });
+            // Blok ini seharusnya jarang sekali berjalan, karena scheduler sudah menangani kasus ini.
+            // Ini berfungsi sebagai fallback jika scheduler gagal berjalan tepat waktu.
+            logger.warn(`calculateFineOnFinish mendeteksi keterlambatan untuk rental ${event.params.rentalId}. Seharusnya ini ditangani oleh scheduler.`);
+            // Biarkan saja, karena scheduler akan menanganinya di siklus berikutnya.
         }
-    } else {
-        // Log ini membantu debugging, memberitahu kita mengapa fungsi ini tidak melakukan apa-apa.
-        logger.info(`Fungsi calculateFineOnFinish dilewati untuk rental ${event.params.rentalId} karena transisi status bukan dari 'active' ke 'finished'. (Dari: ${beforeData.status}, Ke: ${afterData.status})`);
     }
 });
 
@@ -863,64 +1150,617 @@ exports.calculateFineOnFinish = onDocumentUpdated("rentals/{rentalId}", async (e
  * Cloud Function untuk memperpanjang waktu sewa loker.
  * Memerlukan data: { rentalId: string, extensionInHours: number }
  */
-exports.extendRentalTime = onCall({ region: "asia-southeast2" }, async (request) => {
-    const db = getFirestore();
+// exports.extendRentalTime = onCall({ region: "asia-southeast2" }, async (request) => {
+//     const db = getFirestore();
 
-    // 1. Validasi Panggilan (Guard Clauses)
-    // Di v2, context.auth diakses melalui request.auth
-    if (!request.auth) {
-        throw new HttpsError("unauthenticated", "Anda harus login untuk melakukan aksi ini.");
+//     // 1. Validasi Panggilan (Guard Clauses)
+//     // Di v2, context.auth diakses melalui request.auth
+//     if (!request.auth) {
+//         throw new HttpsError("unauthenticated", "Anda harus login untuk melakukan aksi ini.");
+//     }
+
+//     const { rentalId, extensionInHours } = request.data; // Data ada di dalam request.data
+
+//     if (!rentalId || typeof rentalId !== "string") {
+//         throw new HttpsError("invalid-argument", "ID Rental tidak valid.");
+//     }
+//     if (!extensionInHours || typeof extensionInHours !== "number" || extensionInHours <= 0) {
+//         throw new HttpsError("invalid-argument", "Jumlah jam perpanjangan harus angka positif.");
+//     }
+
+//     // 2. & 3. Pengambilan Data, Verifikasi Kepemilikan dan Aturan
+//     try {
+//         const rentalRef = db.collection("rentals").doc(rentalId);
+//         const rentalDoc = await rentalRef.get();
+
+//         if (!rentalDoc.exists) {
+//             throw new HttpsError("not-found", "Data sewa tidak ditemukan.");
+//         }
+
+//         const rentalData = rentalDoc.data();
+//         const loggedInUid = request.auth.uid; // UID pengguna ada di request.auth.uid
+
+//         if (rentalData.user_id.trim() !== loggedInUid) {
+//             throw new HttpsError("permission-denied", "Anda tidak memiliki izin untuk memperpanjang sewa ini.");
+//         }
+
+//         const currentEndTime = rentalData.expected_end_time.toDate();
+//         const now = new Date(); // Waktu server saat ini
+
+//         if (now >= currentEndTime) {
+//             throw new HttpsError("failed-precondition", "Waktu sewa sudah habis dan tidak dapat diperpanjang.");
+//         }
+
+//         // 4. Eksekusi Perpanjangan Waktu
+//         const extensionInMillis = extensionInHours * 60 * 60 * 1000;
+//         const newEndTime = new Date(currentEndTime.getTime() + extensionInMillis);
+
+//         // Gunakan Timestamp yang sudah di-import dari 'firebase-admin/firestore'
+//         await rentalRef.update({
+//             expected_end_time: Timestamp.fromDate(newEndTime)
+//         });
+
+//         // 5. Kirim Respons Sukses
+//         return {
+//             success: true,
+//             message: "Waktu sewa berhasil diperpanjang!",
+//             newEndTime: newEndTime.toISOString(),
+//         };
+//     } catch (error) {
+//         logger.error("Error extending rental time:", error); // Gunakan logger dari 'firebase-functions/logger'
+//         if (error instanceof HttpsError) {
+//             throw error;
+//         }
+//         throw new HttpsError("internal", "Terjadi kesalahan di server.");
+//     }
+// });
+
+/**
+ * (API untuk Hardware) - Dipanggil oleh ESP32 ketika sensor PIR mendeteksi gerakan.
+ * Fungsi ini akan mencari pengguna terkait dan semua admin, lalu mengirim notifikasi.
+ * Memerlukan data: { lockerId: string, esp32_id: string }
+ */
+exports.reportSuspiciousMotion = onRequest(async (request, response) => {
+    // Langkah 1: Validasi request dari ESP32
+    const { lockerId, esp32_id } = request.body;
+    if (!lockerId || !esp32_id) {
+        return response.status(400).send("Parameter lockerId dan esp32_id diperlukan.");
     }
 
-    const { rentalId, extensionInHours } = request.data; // Data ada di dalam request.data
+    logger.warn(`Gerakan terdeteksi di loker ${lockerId} dari ESP32 ${esp32_id}! Memulai proses notifikasi...`);
 
-    if (!rentalId || typeof rentalId !== "string") {
-        throw new HttpsError("invalid-argument", "ID Rental tidak valid.");
-    }
-    if (!extensionInHours || typeof extensionInHours !== "number" || extensionInHours <= 0) {
-        throw new HttpsError("invalid-argument", "Jumlah jam perpanjangan harus angka positif.");
-    }
-
-    // 2. & 3. Pengambilan Data, Verifikasi Kepemilikan dan Aturan
     try {
-        const rentalRef = db.collection("rentals").doc(rentalId);
-        const rentalDoc = await rentalRef.get();
-
-        if (!rentalDoc.exists) {
-            throw new HttpsError("not-found", "Data sewa tidak ditemukan.");
+        // Validasi bahwa ESP32 ini sah untuk loker tersebut
+        const lockerRef = db.collection("lockers").doc(lockerId);
+        const lockerDoc = await lockerRef.get();
+        if (!lockerDoc.exists || lockerDoc.data().esp32_id !== esp32_id) {
+            throw new Error(`Akses ditolak: ESP32 ${esp32_id} tidak sah untuk loker ${lockerId}.`);
         }
 
-        const rentalData = rentalDoc.data();
-        const loggedInUid = request.auth.uid; // UID pengguna ada di request.auth.uid
+        const lockerData = lockerDoc.data();
+        const rentalId = lockerData.current_rental_id;
 
-        if (rentalData.user_id.trim() !== loggedInUid) {
-            throw new HttpsError("permission-denied", "Anda tidak memiliki izin untuk memperpanjang sewa ini.");
+        // Siapkan daftar penerima notifikasi
+        const recipients = [];
+
+        // Langkah 2: Cari pengguna yang sedang menyewa loker tersebut
+        if (rentalId) {
+            const rentalRef = db.collection("rentals").doc(rentalId);
+            const rentalDoc = await rentalRef.get();
+            if (rentalDoc.exists) {
+                recipients.push(rentalDoc.data().user_id);
+            }
         }
 
-        const currentEndTime = rentalData.expected_end_time.toDate();
-        const now = new Date(); // Waktu server saat ini
-
-        if (now >= currentEndTime) {
-            throw new HttpsError("failed-precondition", "Waktu sewa sudah habis dan tidak dapat diperpanjang.");
-        }
-
-        // 4. Eksekusi Perpanjangan Waktu
-        const extensionInMillis = extensionInHours * 60 * 60 * 1000;
-        const newEndTime = new Date(currentEndTime.getTime() + extensionInMillis);
-
-        // Gunakan Timestamp yang sudah di-import dari 'firebase-admin/firestore'
-        await rentalRef.update({
-            expected_end_time: Timestamp.fromDate(newEndTime)
+        // Langkah 3: Cari semua admin
+        const listUsersResult = await getAuth().listUsers(1000);
+        listUsersResult.users.forEach((userRecord) => {
+            if (userRecord.customClaims && userRecord.customClaims.admin === true) {
+                // Hindari duplikasi jika admin adalah penyewa loker
+                if (!recipients.includes(userRecord.uid)) {
+                    recipients.push(userRecord.uid);
+                }
+            }
         });
 
-        // 5. Kirim Respons Sukses
+        if (recipients.length === 0) {
+            logger.warn(`Tidak ditemukan penerima notifikasi untuk loker ${lockerId}.`);
+            return response.status(200).send("Gerakan terdeteksi, tetapi tidak ada penerima.");
+        }
+
+        // Langkah 4: Kirim notifikasi ke semua penerima
+        const notificationPayload = {
+            title: "Peringatan Keamanan Loker!",
+            body: `Terdeteksi gerakan mencurigakan di dekat Loker ${lockerId}.`,
+            locker_id: lockerId,
+            type: "SECURITY_ALERT",
+            timestamp: Timestamp.now(),
+            is_read: false
+        };
+
+        const promises = recipients.map(async (uid) => {
+            // 4a. Simpan notifikasi ke Firestore untuk riwayat
+            await db.collection("notifications").add({
+                user_id: uid, // Target notifikasi
+                ...notificationPayload
+            });
+
+            // 4b. Kirim Push Notification (FCM)
+            // Ambil FCM token dari dokumen user (ini harus disimpan oleh aplikasi Flutter)
+            const userDoc = await db.collection("users").doc(uid).get();
+            if (userDoc.exists && userDoc.data().fcmToken) {
+                const fcmToken = userDoc.data().fcmToken;
+                const message = {
+                    notification: {
+                        title: notificationPayload.title,
+                        body: notificationPayload.body,
+                    },
+                    token: fcmToken,
+                    // Anda bisa menambahkan data lain di sini jika perlu
+                    data: { lockerId: lockerId }
+                };
+                await getMessaging().send(message);
+            }
+        });
+
+        await Promise.all(promises);
+        logger.info(`Berhasil mengirim ${recipients.length} notifikasi untuk loker ${lockerId}.`);
+        return response.status(200).send("Notifikasi berhasil dikirim.");
+    } catch (error) {
+        logger.error(`Gagal memproses notifikasi gerakan untuk loker ${lockerId}:`, error);
+        return response.status(500).send("Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * Cloud Function untuk menetapkan custom claim 'admin' ke seorang pengguna.
+ * Hanya bisa dipanggil oleh admin yang sudah ada.
+ * Memerlukan data: { email: string }
+ */
+exports.addAdminRole = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa yang memanggil fungsi ini adalah admin
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError(
+            "permission-denied",
+            "Hanya admin yang bisa menambahkan admin baru."
+        );
+    }
+
+    // 2. Dapatkan email dari data yang dikirim dan setel claim
+    const email = request.data.email;
+    try {
+        const user = await admin.auth().getUserByEmail(email); // Menggunakan admin SDK
+        await admin.auth().setCustomUserClaims(user.uid, { admin: true });
+
+        // 3. Kirim respons sukses
         return {
-            success: true,
-            message: "Waktu sewa berhasil diperpanjang!",
-            newEndTime: newEndTime.toISOString(),
+            message: `Sukses! ${email} sekarang telah menjadi admin.`,
         };
     } catch (error) {
-        logger.error("Error extending rental time:", error); // Gunakan logger dari 'firebase-functions/logger'
+        logger.error("Gagal menambahkan admin baru:", error);
+        throw new HttpsError("internal", "Gagal menetapkan peran admin.");
+    }
+});
+
+/**
+ * Cloud Function untuk admin mereset PIN sebuah loker.
+ * FUNGSI INI TELAH DIPERBAIKI dengan logika enkripsi AES.
+ * Memerlukan data: { lockerId: string }
+ */
+exports.resetLockerPinByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa yang memanggil fungsi ini adalah admin (Logika Anda sudah benar)
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError(
+            "permission-denied",
+            "Hanya admin yang bisa menjalankan fungsi ini."
+        );
+    }
+
+    const { lockerId } = request.data;
+    if (!lockerId) {
+        throw new HttpsError("invalid-argument", "lockerId harus disediakan.");
+    }
+
+    try {
+        // 2. Logika untuk mereset PIN
+        // Cari dokumen rental yang aktif untuk loker ini.
+        // KOREKSI: Status yang benar adalah 'active', 'locked_due_to_fine', atau 'pending_retrieval'.
+        const rentalsRef = db.collection("rentals");
+        const querySnapshot = await rentalsRef
+            .where("locker_id", "==", lockerId)
+            .where("status", "in", ["active", "locked_due_to_fine", "pending_retrieval"])
+            .limit(1)
+            .get();
+
+        if (querySnapshot.empty) {
+            throw new HttpsError("not-found", `Tidak ada sewa yang dapat direset untuk loker ${lockerId}.`);
+        }
+
+        const rentalDoc = querySnapshot.docs[0];
+        const newPin = Math.floor(1000 + Math.random() * 9000).toString(); // Generate 4 digit PIN baru
+
+        // --- KOREKSI LOGIKA ENKRIPSI DIMULAI DI SINI ---
+
+        // Panggil fungsi 'encrypt' yang sudah Anda buat untuk mengenkripsi PIN baru.
+        // Ini adalah inti dari penerapan keamanan AES Anda.
+        const encryptedNewPin = encrypt(newPin);
+        logger.info(`PIN baru untuk Loker ${lockerId} adalah ${newPin}. Versi terenkripsi dibuat.`);
+
+        // Dapatkan referensi ke dokumen loker yang sesuai.
+        const lockerRef = db.collection("lockers").doc(lockerId);
+
+        // Gunakan Promise.all untuk menjalankan kedua update secara bersamaan.
+        // Ini memastikan konsistensi data antara rental dan loker.
+        await Promise.all([
+            // Update dokumen rental dengan PIN yang sudah dienkripsi.
+            // Ini yang akan dilihat oleh pengguna di aplikasi.
+            rentalDoc.ref.update({ encrypted_pin: encryptedNewPin }),
+
+            // Update dokumen loker dengan PIN teks biasa (plain text).
+            // Ini yang akan dibaca dan divalidasi oleh hardware ESP32.
+            lockerRef.update({ active_pin: newPin })
+        ]);
+
+        // --- AKHIR KOREKSI ---
+
+        // 3. Panggil helper function untuk MENCATAT LOG (Logika Anda sudah benar)
+        await createLogEntry({
+            timestamp: Timestamp.now(),
+            adminId: request.auth.uid,
+            adminEmail: request.auth.token.email,
+            action: "RESET_PIN",
+            details: `Admin mereset PIN untuk Loker ${lockerId}.`,
+            targetId: lockerId,
+            targetType: "LOCKER"
+        });
+
+        // 4. Kirim respons sukses
+        return {
+            success: true,
+            message: `PIN untuk loker ${lockerId} berhasil direset.`,
+            newPin: newPin // Kirim PIN baru (plain text) ke admin untuk keadaan darurat
+        };
+    } catch (error) {
+        logger.error("Gagal mereset PIN oleh admin:", error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * Cloud Function untuk mengambil daftar log aktivitas admin.
+ * Diurutkan dari yang terbaru.
+ */
+exports.getAdminLogs = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Verifikasi bahwa yang memanggil fungsi ini adalah admin
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError(
+            "permission-denied",
+            "Hanya admin yang bisa melihat log aktivitas."
+        );
+    }
+
+    try {
+        const logsRef = db.collection("logs");
+        const querySnapshot = await logsRef
+            .orderBy("timestamp", "desc") // Urutkan dari yang paling baru
+            .limit(50) // Batasi 50 log terbaru untuk awal
+            .get();
+
+        const logs = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            logs.push({
+                id: doc.id,
+                ...data,
+                // Konversi timestamp ke format yang lebih mudah dibaca di klien
+                timestamp: data.timestamp.toDate().toISOString()
+            });
+        });
+
+        return { logs };
+    } catch (error) {
+        logger.error("Gagal mengambil log admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data log.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar semua riwayat sewa (rentals).
+ * Diurutkan dari yang terbaru, dengan batasan jumlah untuk performa.
+ */
+exports.getAllRentalsByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Query ke koleksi 'rentals'.
+        const rentalsRef = db.collection("rentals");
+        const querySnapshot = await rentalsRef
+            .orderBy("start_time", "desc") // Urutkan berdasarkan waktu mulai, yang terbaru di atas.
+            .limit(100) // Batasi 100 data terbaru untuk mencegah overload.
+            .get();
+
+        // Langkah 3: Format data untuk dikirim ke frontend.
+        const rentals = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            rentals.push({
+                id: doc.id, // Sertakan ID dokumen
+                ...data,
+                // Ubah format timestamp agar mudah dibaca di frontend
+                start_time: data.start_time ? data.start_time.toDate().toISOString() : null,
+                expected_end_time: data.expected_end_time ? data.expected_end_time.toDate().toISOString() : null,
+                actual_end_time: data.actual_end_time ? data.actual_end_time.toDate().toISOString() : null,
+                updated_at: data.updated_at ? data.updated_at.toDate().toISOString() : null,
+            });
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${rentals.length} data rental.`);
+        return { rentals };
+    } catch (error) {
+        logger.error("Gagal mengambil semua data rental oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data rental.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar dan status semua loker.
+ */
+exports.getAllLockersByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Query ke koleksi 'lockers'.
+        const lockersRef = db.collection("lockers");
+        const querySnapshot = await lockersRef.get();
+
+        // Langkah 3: Format data untuk dikirim ke frontend.
+        const lockers = [];
+        querySnapshot.forEach((doc) => {
+            lockers.push({
+                id: doc.id,
+                ...doc.data(),
+            });
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${lockers.length} data loker.`);
+        return { lockers };
+    } catch (error) {
+        logger.error("Gagal mengambil semua data loker oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data loker.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar semua pengguna yang terdaftar di sistem.
+ * Fungsi ini menggunakan Firebase Authentication API.
+ */
+exports.getAllUsersByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Panggil Admin Auth API untuk mengambil daftar pengguna.
+        // Kita batasi 1000 pengguna pertama untuk performa.
+        // Untuk aplikasi yang lebih besar, perlu implementasi pagination.
+        const listUsersResult = await getAuth().listUsers(1000);
+
+        // Langkah 3: Format data agar lebih mudah digunakan di frontend.
+        // Kita hanya mengambil informasi yang paling relevan.
+        const users = listUsersResult.users.map((userRecord) => {
+            return {
+                uid: userRecord.uid,
+                email: userRecord.email,
+                displayName: userRecord.displayName || "Tidak Ada Nama",
+                photoURL: userRecord.photoURL || null,
+                disabled: userRecord.disabled,
+                creationTime: userRecord.metadata.creationTime,
+                lastSignInTime: userRecord.metadata.lastSignInTime,
+                // Kita juga bisa melihat apakah seorang user adalah admin atau bukan
+                customClaims: userRecord.customClaims || {}
+            };
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${users.length} data pengguna.`);
+        return { users };
+    } catch (error) {
+        logger.error("Gagal mengambil daftar pengguna oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data pengguna.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar semua riwayat pembayaran dari semua pengguna.
+ * Diurutkan dari yang terbaru.
+ */
+exports.getAllPaymentsByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Query ke koleksi 'payments'.
+        const paymentsRef = db.collection("payments");
+        const querySnapshot = await paymentsRef
+            .orderBy("created_at", "desc") // Urutkan berdasarkan waktu dibuat, yang terbaru di atas.
+            .limit(100) // Batasi 100 data terbaru untuk awal.
+            .get();
+
+        // Langkah 3: Format data untuk dikirim ke frontend.
+        const payments = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            payments.push({
+                id: doc.id, // ID dokumen pembayaran (order_id dari Midtrans)
+                ...data,
+                // Ubah format timestamp agar mudah dibaca di frontend
+                created_at: data.created_at ? data.created_at.toDate().toISOString() : null,
+                updated_at: data.updated_at ? data.updated_at.toDate().toISOString() : null,
+            });
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${payments.length} data pembayaran.`);
+        return { payments };
+    } catch (error) {
+        logger.error("Gagal mengambil semua data pembayaran oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data pembayaran.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Memicu pengiriman email reset password ke seorang pengguna.
+ * FUNGSI INI TELAH DIPERBAIKI untuk mengirim email secara manual.
+ */
+exports.resetUserPasswordByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi admin (logika Anda sudah benar)
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    const { getAuth } = require("firebase-admin/auth");
+    const email = request.data.email;
+    if (!email || typeof email !== "string") {
+        throw new HttpsError("invalid-argument", "Parameter 'email' diperlukan.");
+    }
+
+    if (!isValidEmail(email)) {
+        logger.error("Invalid email format", { email });
+        throw new HttpsError("invalid-argument", "Format email tidak valid.");
+    }
+
+    try {
+        // --- LANGKAH A: BUAT LINK RESET (seperti sebelumnya) ---
+        const resetLink = await getAuth().generatePasswordResetLink(email);
+        logger.info(`Link reset password berhasil dibuat untuk: ${email}`);
+
+        // --- LANGKAH B: KIRIM EMAIL MENGGUNAKAN NODEMAILER ---
+        // Konfigurasi transporter email menggunakan kredensial dari Secret Manager
+        const transporter = nodemailer.createTransport({
+            service: "gmail",
+            auth: {
+                user: SENDER_EMAIL.value(),
+                pass: SENDER_PASSWORD.value(), // Gunakan App Password di sini
+            },
+        });
+
+        // Konfigurasi isi email
+        const mailOptions = {
+            from: `"SAF-E Locker Admin" <${SENDER_EMAIL.value()}>`,
+            to: email, // Kirim ke email pengguna target
+            subject: "Reset Password untuk Akun SAF-E Locker Anda",
+            html: `
+                <p>Halo,</p>
+                <p>Anda menerima email ini karena ada permintaan reset password untuk akun Anda dari admin.</p>
+                <p>Silakan klik link di bawah ini untuk membuat password baru:</p>
+                <a href="${resetLink}">Reset Password Anda</a>
+                <p>Jika Anda tidak merasa meminta ini, silakan abaikan email ini.</p>
+                <p>Terima kasih,</p>
+                <p>Tim SAF-E Locker</p>
+            `,
+        };
+
+        // Kirim email
+        await transporter.sendMail(mailOptions);
+        logger.info(`Email reset password berhasil dikirim ke ${email}`);
+
+        // Kirim pesan sukses kembali ke antarmuka admin
+        return {
+            success: true,
+            message: `Email reset password telah berhasil dikirim ke ${email}.`,
+        };
+    } catch (error) {
+        logger.error(`Gagal memproses reset password untuk ${email}:`, error);
+        if (error.code === "auth/user-not-found") {
+            throw new HttpsError("not-found", `Pengguna dengan email ${email} tidak ditemukan.`);
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengubah status loker antara 'available' dan 'maintenance'.
+ * Fungsi ini memiliki pengaman untuk mencegah menonaktifkan loker yang sedang digunakan.
+ * Memerlukan data: { lockerId: string, newStatus: 'available' | 'maintenance' }
+ */
+exports.toggleLockerStatusByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    // Langkah 2: Validasi input dari request.
+    const { lockerId, newStatus } = request.data;
+    if (!lockerId || !newStatus) {
+        throw new HttpsError("invalid-argument", "Parameter 'lockerId' dan 'newStatus' diperlukan.");
+    }
+    // Pastikan status baru yang dikirim valid.
+    if (!["available", "maintenance"].includes(newStatus)) {
+        throw new HttpsError("invalid-argument", "Nilai 'newStatus' hanya boleh 'available' atau 'maintenance'.");
+    }
+
+    const lockerRef = db.collection("lockers").doc(lockerId);
+
+    try {
+        // Langkah 3: Periksa status loker saat ini sebelum mengubahnya.
+        const lockerDoc = await lockerRef.get();
+        if (!lockerDoc.exists) {
+            throw new HttpsError("not-found", `Loker dengan ID ${lockerId} tidak ditemukan.`);
+        }
+
+        const currentStatus = lockerDoc.data().status;
+
+        // --- INI ADALAH LOGIKA PENGAMAN PENTING ---
+        // Hanya izinkan perubahan jika loker dalam kondisi 'available' atau 'maintenance'.
+        // Ini mencegah admin menonaktifkan loker yang sedang 'occupied', 'locked_due_to_fine', dll.
+        if (currentStatus !== "available" && currentStatus !== "maintenance") {
+            throw new HttpsError(
+                "failed-precondition",
+                `Loker sedang digunakan (status: ${currentStatus}) dan tidak dapat diubah statusnya.`
+            );
+        }
+
+        // Langkah 4: Jika aman, update status loker.
+        await lockerRef.update({
+            status: newStatus,
+            last_updated: Timestamp.now()
+        });
+
+        const logDetails = `Admin mengubah status Loker ${lockerId} menjadi '${newStatus}'.`;
+        logger.info(logDetails);
+
+        // Langkah 5: Catat aktivitas ini di log admin.
+        await createLogEntry({
+            timestamp: Timestamp.now(),
+            adminId: request.auth.uid,
+            adminEmail: request.auth.token.email,
+            action: "TOGGLE_LOCKER_STATUS",
+            details: logDetails,
+            targetId: lockerId,
+            targetType: "LOCKER"
+        });
+
+        // Langkah 6: Kirim pesan sukses kembali.
+        return {
+            success: true,
+            message: `Status untuk loker ${lockerId} berhasil diubah menjadi '${newStatus}'.`,
+        };
+    } catch (error) {
+        logger.error(`Gagal mengubah status loker ${lockerId} oleh admin:`, error);
         if (error instanceof HttpsError) {
             throw error;
         }
