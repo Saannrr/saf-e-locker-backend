@@ -149,7 +149,7 @@ function isValidEmail(email) {
     return emailRegex.test(email);
 }
 
-// --- BAGIAN API UNTUK FRONTEND ---
+// --- BAGIAN API UNTUK FRONTEND (User) ---
 
 /**
  * (API untuk User) - Memulai proses sewa dengan mencari loker yang tersedia,
@@ -173,13 +173,22 @@ exports.initiateRental = onCall({ region: "asia-southeast2" }, async (request) =
     // 3. Gunakan Transaksi Firestore untuk keamanan dan konsistensi
     try {
         const rentalId = await db.runTransaction(async (t) => {
-            // Cari satu loker yang statusnya 'available'
+            // --- PERUBAHAN DIMULAI DI SINI ---
+            // 1. Ambil konfigurasi harga terlebih dahulu.
+            const pricingRef = db.collection("config").doc("pricing");
+            const pricingDoc = await t.get(pricingRef);
+            if (!pricingDoc.exists || !pricingDoc.data().hourly_rate) {
+                throw new HttpsError("internal", "Konfigurasi harga tidak ditemukan. Hubungi administrator.");
+            }
+            const hourlyRate = pricingDoc.data().hourly_rate;
+            // --- AKHIR PERUBAHAN ---
+
+            // Cari loker yang tersedia
             const lockersRef = db.collection("lockers");
             const availableLockerQuery = lockersRef.where("status", "==", "available").limit(1);
             const lockerSnapshot = await t.get(availableLockerQuery);
 
             if (lockerSnapshot.empty) {
-                // Tidak ada loker tersedia, lempar error yang akan ditangkap oleh klien
                 throw new HttpsError("not-found", "Maaf, tidak ada loker yang tersedia saat ini.");
             }
 
@@ -187,29 +196,34 @@ exports.initiateRental = onCall({ region: "asia-southeast2" }, async (request) =
             const lockerId = lockerDoc.id;
             const lockerRef = lockerDoc.ref;
 
-            // Hitung biaya dan waktu di server (lebih aman)
-            const hourlyRate = 5000; // Definisikan harga per jam di sini
+            // --- PERUBAHAN DIMULAI DI SINI ---
+            // Hitung biaya berdasarkan harga dari database, bukan hardcode.
             const initialCost = durationInHours * hourlyRate;
+            // --- AKHIR PERUBAHAN ---
+
             const startTime = new Date();
             const expectedEndTime = new Date(startTime.getTime() + durationInHours * 60 * 60 * 1000);
 
             // Buat dokumen rental baru
-            const rentalRef = db.collection("rentals").doc(); // Buat ID baru
+            const rentalRef = db.collection("rentals").doc();
             t.set(rentalRef, {
                 user_id: userId,
                 locker_id: lockerId,
                 start_time: Timestamp.fromDate(startTime),
                 duration_hours: durationInHours,
-                status: "pending_payment", // Status awal sebelum dibayar
+                status: "pending_payment",
                 payment_status: "unpaid",
                 expected_end_time: Timestamp.fromDate(expectedEndTime),
-                initial_cost: initialCost,
+                initial_cost: initialCost, // Gunakan biaya yang sudah dihitung
                 fine_amount: 0,
             });
 
-            logger.info(`Loker ${lockerId} telah direservasi untuk rental ${rentalRef.id}.`);
+            // Reservasi loker
+            t.update(lockerRef, {
+                status: "reserved",
+                current_rental_id: rentalRef.id
+            });
 
-            // Kembalikan ID rental yang baru dibuat
             return rentalRef.id;
         });
 
@@ -365,6 +379,733 @@ exports.terminateRentalByUser = onCall({ region: "asia-southeast2" }, async (req
         if (error instanceof HttpsError) {
             throw error;
         }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * (API untuk User) - Mengambil data profil lengkap untuk pengguna yang sedang login.
+ * Fungsi ini tidak memerlukan parameter karena ID pengguna diambil secara otomatis
+ * dari konteks autentikasi.
+ */
+exports.getUserProfile = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa pengguna sudah login. Ini adalah langkah keamanan utama.
+    if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Anda harus login untuk melihat profil.");
+    }
+    const uid = request.auth.uid;
+
+    try {
+        // 2. Ambil data dari Firebase Authentication
+        const userRecord = await getAuth().getUser(uid);
+
+        // 3. Ambil data tambahan dari koleksi 'users' di Firestore
+        const userDocRef = db.collection("users").doc(uid);
+        const userDoc = await userDocRef.get();
+
+        // 4. Gabungkan data dari kedua sumber
+        let username = "Belum diatur"; // Nilai default jika tidak ada di Firestore
+        if (userDoc.exists) {
+            username = userDoc.data().username || username;
+        }
+
+        // Siapkan objek profil yang akan dikirim kembali ke aplikasi
+        const userProfile = {
+            uid: userRecord.uid,
+            email: userRecord.email,
+            username: username, // Diambil dari Firestore
+            displayName: userRecord.displayName, // Biasanya null jika tidak diatur
+            photoURL: userRecord.photoURL,
+            creationTime: userRecord.metadata.creationTime,
+            lastSignInTime: userRecord.metadata.lastSignInTime,
+        };
+
+        logger.info(`Profil berhasil diambil untuk pengguna: ${uid}`);
+
+        // 5. Kirim data profil yang sudah lengkap
+        return {
+            success: true,
+            profile: userProfile
+        };
+    } catch (error) {
+        logger.error(`Gagal mengambil profil untuk pengguna ${uid}:`, error);
+        if (error.code === "auth/user-not-found") {
+            throw new HttpsError("not-found", "Data autentikasi pengguna tidak ditemukan.");
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan saat mengambil data profil.");
+    }
+});
+
+/**
+ * (API untuk User) - Mengambil riwayat sewa untuk pengguna yang sedang login.
+ * Diurutkan dari yang terbaru, dengan batasan jumlah untuk performa.
+ * Tidak memerlukan parameter.
+ */
+exports.getRentalHistory = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa pengguna sudah login.
+    if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Anda harus login untuk melihat riwayat sewa.");
+    }
+    const uid = request.auth.uid;
+
+    try {
+        // 2. Query ke koleksi 'rentals'.
+        const rentalsRef = db.collection("rentals");
+        const querySnapshot = await rentalsRef
+            // Filter hanya untuk dokumen yang 'user_id'-nya cocok dengan pengguna yang login.
+            .where("user_id", "==", uid)
+            // Urutkan berdasarkan waktu mulai, yang terbaru di atas.
+            .orderBy("start_time", "desc")
+            // Batasi 50 data terbaru untuk mencegah overload.
+            .limit(50)
+            .get();
+
+        // 3. Format data untuk dikirim ke frontend.
+        const history = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            history.push({
+                id: doc.id, // Sertakan ID dokumen rental
+                ...data,
+                // Ubah format timestamp agar mudah dibaca di frontend
+                start_time: data.start_time ? data.start_time.toDate().toISOString() : null,
+                expected_end_time: data.expected_end_time ? data.expected_end_time.toDate().toISOString() : null,
+                actual_end_time: data.actual_end_time ? data.actual_end_time.toDate().toISOString() : null,
+            });
+        });
+
+        // 4. Kirim data kembali.
+        logger.info(`Riwayat rental berhasil diambil untuk pengguna: ${uid}. Ditemukan ${history.length} item.`);
+        return {
+            success: true,
+            history: history
+        };
+    } catch (error) {
+        logger.error(`Gagal mengambil riwayat rental untuk pengguna ${uid}:`, error);
+        throw new HttpsError("internal", "Gagal mengambil data riwayat sewa.");
+    }
+});
+
+/**
+ * (API untuk User) - Mengambil riwayat pembayaran untuk pengguna yang sedang login.
+ * Diurutkan dari yang terbaru, dengan batasan jumlah untuk performa.
+ * Tidak memerlukan parameter.
+ */
+exports.getPaymentHistory = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa pengguna sudah login.
+    if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Anda harus login untuk melihat riwayat pembayaran.");
+    }
+    const uid = request.auth.uid;
+
+    try {
+        // 2. Query ke koleksi 'payments'.
+        const paymentsRef = db.collection("payments");
+        const querySnapshot = await paymentsRef
+            // Filter hanya untuk dokumen yang 'user_id'-nya cocok dengan pengguna yang login.
+            .where("user_id", "==", uid)
+            // Urutkan berdasarkan waktu dibuat, yang terbaru di atas.
+            .orderBy("created_at", "desc")
+            // Batasi 50 data terbaru untuk mencegah overload.
+            .limit(50)
+            .get();
+
+        // 3. Format data untuk dikirim ke frontend.
+        const history = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            // Kita tidak perlu mengirim ulang semua 'response_data' yang besar.
+            // Cukup kirim data yang paling relevan.
+            history.push({
+                id: doc.id,
+                rental_id: data.rental_id,
+                amount: data.amount,
+                payment_type: data.payment_type,
+                status: data.status,
+                // Ubah format timestamp agar mudah dibaca di frontend
+                created_at: data.created_at ? data.created_at.toDate().toISOString() : null,
+            });
+        });
+
+        // 4. Kirim data kembali.
+        logger.info(`Riwayat pembayaran berhasil diambil untuk pengguna: ${uid}. Ditemukan ${history.length} item.`);
+        return {
+            success: true,
+            history: history
+        };
+    } catch (error) {
+        logger.error(`Gagal mengambil riwayat pembayaran untuk pengguna ${uid}:`, error);
+        throw new HttpsError("internal", "Gagal mengambil data riwayat pembayaran.");
+    }
+});
+
+// --- BAGIAN API UNTUK FRONTEND (Admin) ---
+
+/**
+ * Cloud Function untuk menetapkan custom claim 'admin' ke seorang pengguna.
+ * Hanya bisa dipanggil oleh admin yang sudah ada.
+ * Memerlukan data: { email: string }
+ */
+exports.addAdminRole = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa yang memanggil fungsi ini adalah admin
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError(
+            "permission-denied",
+            "Hanya admin yang bisa menambahkan admin baru."
+        );
+    }
+
+    // 2. Dapatkan email dari data yang dikirim dan setel claim
+    const email = request.data.email;
+    try {
+        const user = await admin.auth().getUserByEmail(email); // Menggunakan admin SDK
+        await admin.auth().setCustomUserClaims(user.uid, { admin: true });
+
+        // 3. Kirim respons sukses
+        return {
+            message: `Sukses! ${email} sekarang telah menjadi admin.`,
+        };
+    } catch (error) {
+        logger.error("Gagal menambahkan admin baru:", error);
+        throw new HttpsError("internal", "Gagal menetapkan peran admin.");
+    }
+});
+
+/**
+ * Cloud Function untuk admin mereset PIN sebuah loker.
+ * FUNGSI INI TELAH DIPERBAIKI dengan logika enkripsi AES.
+ * Memerlukan data: { lockerId: string }
+ */
+exports.resetLockerPinByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa yang memanggil fungsi ini adalah admin (Logika Anda sudah benar)
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError(
+            "permission-denied",
+            "Hanya admin yang bisa menjalankan fungsi ini."
+        );
+    }
+
+    const { lockerId } = request.data;
+    if (!lockerId) {
+        throw new HttpsError("invalid-argument", "lockerId harus disediakan.");
+    }
+
+    try {
+        // 2. Logika untuk mereset PIN
+        // Cari dokumen rental yang aktif untuk loker ini.
+        // KOREKSI: Status yang benar adalah 'active', 'locked_due_to_fine', atau 'pending_retrieval'.
+        const rentalsRef = db.collection("rentals");
+        const querySnapshot = await rentalsRef
+            .where("locker_id", "==", lockerId)
+            .where("status", "in", ["active", "locked_due_to_fine", "pending_retrieval"])
+            .limit(1)
+            .get();
+
+        if (querySnapshot.empty) {
+            throw new HttpsError("not-found", `Tidak ada sewa yang dapat direset untuk loker ${lockerId}.`);
+        }
+
+        const rentalDoc = querySnapshot.docs[0];
+        const newPin = Math.floor(1000 + Math.random() * 9000).toString(); // Generate 4 digit PIN baru
+
+        // --- KOREKSI LOGIKA ENKRIPSI DIMULAI DI SINI ---
+
+        // Panggil fungsi 'encrypt' yang sudah Anda buat untuk mengenkripsi PIN baru.
+        // Ini adalah inti dari penerapan keamanan AES Anda.
+        const encryptedNewPin = encrypt(newPin);
+        logger.info(`PIN baru untuk Loker ${lockerId} adalah ${newPin}. Versi terenkripsi dibuat.`);
+
+        // Dapatkan referensi ke dokumen loker yang sesuai.
+        const lockerRef = db.collection("lockers").doc(lockerId);
+
+        // Gunakan Promise.all untuk menjalankan kedua update secara bersamaan.
+        // Ini memastikan konsistensi data antara rental dan loker.
+        await Promise.all([
+            // Update dokumen rental dengan PIN yang sudah dienkripsi.
+            // Ini yang akan dilihat oleh pengguna di aplikasi.
+            rentalDoc.ref.update({ encrypted_pin: encryptedNewPin }),
+
+            // Update dokumen loker dengan PIN teks biasa (plain text).
+            // Ini yang akan dibaca dan divalidasi oleh hardware ESP32.
+            lockerRef.update({ active_pin: newPin })
+        ]);
+
+        // --- AKHIR KOREKSI ---
+
+        // 3. Panggil helper function untuk MENCATAT LOG (Logika Anda sudah benar)
+        await createLogEntry({
+            timestamp: Timestamp.now(),
+            adminId: request.auth.uid,
+            adminEmail: request.auth.token.email,
+            action: "RESET_PIN",
+            details: `Admin mereset PIN untuk Loker ${lockerId}.`,
+            targetId: lockerId,
+            targetType: "LOCKER"
+        });
+
+        // 4. Kirim respons sukses
+        return {
+            success: true,
+            message: `PIN untuk loker ${lockerId} berhasil direset.`,
+            newPin: newPin // Kirim PIN baru (plain text) ke admin untuk keadaan darurat
+        };
+    } catch (error) {
+        logger.error("Gagal mereset PIN oleh admin:", error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * Cloud Function untuk mengambil daftar log aktivitas admin.
+ * Diurutkan dari yang terbaru.
+ */
+exports.getAdminLogs = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Verifikasi bahwa yang memanggil fungsi ini adalah admin
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError(
+            "permission-denied",
+            "Hanya admin yang bisa melihat log aktivitas."
+        );
+    }
+
+    try {
+        const logsRef = db.collection("logs");
+        const querySnapshot = await logsRef
+            .orderBy("timestamp", "desc") // Urutkan dari yang paling baru
+            .limit(50) // Batasi 50 log terbaru untuk awal
+            .get();
+
+        const logs = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            logs.push({
+                id: doc.id,
+                ...data,
+                // Konversi timestamp ke format yang lebih mudah dibaca di klien
+                timestamp: data.timestamp.toDate().toISOString()
+            });
+        });
+
+        return { logs };
+    } catch (error) {
+        logger.error("Gagal mengambil log admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data log.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar semua riwayat sewa (rentals).
+ * Diurutkan dari yang terbaru, dengan batasan jumlah untuk performa.
+ */
+exports.getAllRentalsByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Query ke koleksi 'rentals'.
+        const rentalsRef = db.collection("rentals");
+        const querySnapshot = await rentalsRef
+            .orderBy("start_time", "desc") // Urutkan berdasarkan waktu mulai, yang terbaru di atas.
+            .limit(100) // Batasi 100 data terbaru untuk mencegah overload.
+            .get();
+
+        // Langkah 3: Format data untuk dikirim ke frontend.
+        const rentals = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            rentals.push({
+                id: doc.id, // Sertakan ID dokumen
+                ...data,
+                // Ubah format timestamp agar mudah dibaca di frontend
+                start_time: data.start_time ? data.start_time.toDate().toISOString() : null,
+                expected_end_time: data.expected_end_time ? data.expected_end_time.toDate().toISOString() : null,
+                actual_end_time: data.actual_end_time ? data.actual_end_time.toDate().toISOString() : null,
+                updated_at: data.updated_at ? data.updated_at.toDate().toISOString() : null,
+            });
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${rentals.length} data rental.`);
+        return { rentals };
+    } catch (error) {
+        logger.error("Gagal mengambil semua data rental oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data rental.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar dan status semua loker.
+ */
+exports.getAllLockersByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Query ke koleksi 'lockers'.
+        const lockersRef = db.collection("lockers");
+        const querySnapshot = await lockersRef.get();
+
+        // Langkah 3: Format data untuk dikirim ke frontend.
+        const lockers = [];
+        querySnapshot.forEach((doc) => {
+            lockers.push({
+                id: doc.id,
+                ...doc.data(),
+            });
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${lockers.length} data loker.`);
+        return { lockers };
+    } catch (error) {
+        logger.error("Gagal mengambil semua data loker oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data loker.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar semua pengguna yang terdaftar di sistem.
+ * Fungsi ini menggunakan Firebase Authentication API.
+ */
+exports.getAllUsersByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Panggil Admin Auth API untuk mengambil daftar pengguna.
+        // Kita batasi 1000 pengguna pertama untuk performa.
+        // Untuk aplikasi yang lebih besar, perlu implementasi pagination.
+        const listUsersResult = await getAuth().listUsers(1000);
+
+        // Langkah 3: Format data agar lebih mudah digunakan di frontend.
+        // Kita hanya mengambil informasi yang paling relevan.
+        const users = listUsersResult.users.map((userRecord) => {
+            return {
+                uid: userRecord.uid,
+                email: userRecord.email,
+                displayName: userRecord.displayName || "Tidak Ada Nama",
+                photoURL: userRecord.photoURL || null,
+                disabled: userRecord.disabled,
+                creationTime: userRecord.metadata.creationTime,
+                lastSignInTime: userRecord.metadata.lastSignInTime,
+                // Kita juga bisa melihat apakah seorang user adalah admin atau bukan
+                customClaims: userRecord.customClaims || {}
+            };
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${users.length} data pengguna.`);
+        return { users };
+    } catch (error) {
+        logger.error("Gagal mengambil daftar pengguna oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data pengguna.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil daftar semua riwayat pembayaran dari semua pengguna.
+ * Diurutkan dari yang terbaru.
+ */
+exports.getAllPaymentsByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    try {
+        // Langkah 2: Query ke koleksi 'payments'.
+        const paymentsRef = db.collection("payments");
+        const querySnapshot = await paymentsRef
+            .orderBy("created_at", "desc") // Urutkan berdasarkan waktu dibuat, yang terbaru di atas.
+            .limit(100) // Batasi 100 data terbaru untuk awal.
+            .get();
+
+        // Langkah 3: Format data untuk dikirim ke frontend.
+        const payments = [];
+        querySnapshot.forEach((doc) => {
+            const data = doc.data();
+            payments.push({
+                id: doc.id, // ID dokumen pembayaran (order_id dari Midtrans)
+                ...data,
+                // Ubah format timestamp agar mudah dibaca di frontend
+                created_at: data.created_at ? data.created_at.toDate().toISOString() : null,
+                updated_at: data.updated_at ? data.updated_at.toDate().toISOString() : null,
+            });
+        });
+
+        // Langkah 4: Kirim data kembali.
+        logger.info(`Admin ${request.auth.token.email} mengambil ${payments.length} data pembayaran.`);
+        return { payments };
+    } catch (error) {
+        logger.error("Gagal mengambil semua data pembayaran oleh admin:", error);
+        throw new HttpsError("internal", "Gagal mengambil data pembayaran.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Memicu pengiriman email reset password ke seorang pengguna.
+ * FUNGSI INI TELAH DIPERBAIKI untuk mengirim email secara manual.
+ */
+exports.resetUserPasswordByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi admin (logika Anda sudah benar)
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    const { getAuth } = require("firebase-admin/auth");
+    const email = request.data.email;
+    if (!email || typeof email !== "string") {
+        throw new HttpsError("invalid-argument", "Parameter 'email' diperlukan.");
+    }
+
+    if (!isValidEmail(email)) {
+        logger.error("Invalid email format", { email });
+        throw new HttpsError("invalid-argument", "Format email tidak valid.");
+    }
+
+    try {
+        // --- LANGKAH A: BUAT LINK RESET (seperti sebelumnya) ---
+        const resetLink = await getAuth().generatePasswordResetLink(email);
+        logger.info(`Link reset password berhasil dibuat untuk: ${email}`);
+
+        // --- LANGKAH B: KIRIM EMAIL MENGGUNAKAN NODEMAILER ---
+        // Konfigurasi transporter email menggunakan kredensial dari Secret Manager
+        const transporter = nodemailer.createTransport({
+            service: "gmail",
+            auth: {
+                user: SENDER_EMAIL.value(),
+                pass: SENDER_PASSWORD.value(), // Gunakan App Password di sini
+            },
+        });
+
+        // Konfigurasi isi email
+        const mailOptions = {
+            from: `"SAF-E Locker Admin" <${SENDER_EMAIL.value()}>`,
+            to: email, // Kirim ke email pengguna target
+            subject: "Reset Password untuk Akun SAF-E Locker Anda",
+            html: `
+                <p>Halo,</p>
+                <p>Anda menerima email ini karena ada permintaan reset password untuk akun Anda dari admin.</p>
+                <p>Silakan klik link di bawah ini untuk membuat password baru:</p>
+                <a href="${resetLink}">Reset Password Anda</a>
+                <p>Jika Anda tidak merasa meminta ini, silakan abaikan email ini.</p>
+                <p>Terima kasih,</p>
+                <p>Tim SAF-E Locker</p>
+            `,
+        };
+
+        // Kirim email
+        await transporter.sendMail(mailOptions);
+        logger.info(`Email reset password berhasil dikirim ke ${email}`);
+
+        // Kirim pesan sukses kembali ke antarmuka admin
+        return {
+            success: true,
+            message: `Email reset password telah berhasil dikirim ke ${email}.`,
+        };
+    } catch (error) {
+        logger.error(`Gagal memproses reset password untuk ${email}:`, error);
+        if (error.code === "auth/user-not-found") {
+            throw new HttpsError("not-found", `Pengguna dengan email ${email} tidak ditemukan.`);
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengubah status loker antara 'available' dan 'maintenance'.
+ * Fungsi ini memiliki pengaman untuk mencegah menonaktifkan loker yang sedang digunakan.
+ * Memerlukan data: { lockerId: string, newStatus: 'available' | 'maintenance' }
+ */
+exports.toggleLockerStatusByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    // Langkah 2: Validasi input dari request.
+    const { lockerId, newStatus } = request.data;
+    if (!lockerId || !newStatus) {
+        throw new HttpsError("invalid-argument", "Parameter 'lockerId' dan 'newStatus' diperlukan.");
+    }
+    // Pastikan status baru yang dikirim valid.
+    if (!["available", "maintenance"].includes(newStatus)) {
+        throw new HttpsError("invalid-argument", "Nilai 'newStatus' hanya boleh 'available' atau 'maintenance'.");
+    }
+
+    const lockerRef = db.collection("lockers").doc(lockerId);
+
+    try {
+        // Langkah 3: Periksa status loker saat ini sebelum mengubahnya.
+        const lockerDoc = await lockerRef.get();
+        if (!lockerDoc.exists) {
+            throw new HttpsError("not-found", `Loker dengan ID ${lockerId} tidak ditemukan.`);
+        }
+
+        const currentStatus = lockerDoc.data().status;
+
+        // --- INI ADALAH LOGIKA PENGAMAN PENTING ---
+        // Hanya izinkan perubahan jika loker dalam kondisi 'available' atau 'maintenance'.
+        // Ini mencegah admin menonaktifkan loker yang sedang 'occupied', 'locked_due_to_fine', dll.
+        if (currentStatus !== "available" && currentStatus !== "maintenance") {
+            throw new HttpsError(
+                "failed-precondition",
+                `Loker sedang digunakan (status: ${currentStatus}) dan tidak dapat diubah statusnya.`
+            );
+        }
+
+        // Langkah 4: Jika aman, update status loker.
+        await lockerRef.update({
+            status: newStatus,
+            last_updated: Timestamp.now()
+        });
+
+        const logDetails = `Admin mengubah status Loker ${lockerId} menjadi '${newStatus}'.`;
+        logger.info(logDetails);
+
+        // Langkah 5: Catat aktivitas ini di log admin.
+        await createLogEntry({
+            timestamp: Timestamp.now(),
+            adminId: request.auth.uid,
+            adminEmail: request.auth.token.email,
+            action: "TOGGLE_LOCKER_STATUS",
+            details: logDetails,
+            targetId: lockerId,
+            targetType: "LOCKER"
+        });
+
+        // Langkah 6: Kirim pesan sukses kembali.
+        return {
+            success: true,
+            message: `Status untuk loker ${lockerId} berhasil diubah menjadi '${newStatus}'.`,
+        };
+    } catch (error) {
+        logger.error(`Gagal mengubah status loker ${lockerId} oleh admin:`, error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Memberikan akses "kunci master" untuk membuka loker apapun.
+ * Ini adalah fungsi dengan hak akses tinggi dan setiap penggunaannya akan dicatat.
+ * Memerlukan data: { lockerId: string }
+ */
+exports.openAnyLockerByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    // 2. Validasi input dari request.
+    const { lockerId } = request.data;
+    if (!lockerId) {
+        throw new HttpsError("invalid-argument", "Parameter 'lockerId' diperlukan.");
+    }
+
+    const db = getFirestore();
+    const lockerRef = db.collection("lockers").doc(lockerId);
+
+    try {
+        // 3. Periksa apakah loker benar-benar ada.
+        const lockerDoc = await lockerRef.get();
+        if (!lockerDoc.exists) {
+            throw new HttpsError("not-found", `Loker dengan ID ${lockerId} tidak ditemukan.`);
+        }
+
+        // 4. Langsung kirim perintah buka dengan mengubah 'isLocked' menjadi false.
+        // Karena ini adalah override dari admin, kita tidak perlu memeriksa status loker saat ini.
+        await lockerRef.update({
+            isLocked: false
+        });
+
+        const logDetails = `Admin membuka paksa Loker ${lockerId}.`;
+        logger.info(logDetails);
+
+        // 5. WAJIB: Catat aktivitas ini di log admin untuk audit.
+        await createLogEntry({
+            timestamp: Timestamp.now(),
+            adminId: request.auth.uid,
+            adminEmail: request.auth.token.email,
+            action: "ADMIN_OPEN_LOCKER",
+            details: logDetails,
+            targetId: lockerId,
+            targetType: "LOCKER"
+        });
+
+        // 6. Kirim pesan sukses kembali.
+        return {
+            success: true,
+            message: `Perintah buka untuk loker ${lockerId} telah berhasil dikirim.`,
+        };
+    } catch (error) {
+        logger.error(`Gagal membuka loker ${lockerId} oleh admin:`, error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengatur atau memperbarui tarif harga sewa per jam.
+ * Memerlukan data: { hourlyRate: number }
+ */
+exports.setPricingByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    // 2. Validasi input dari request.
+    const { hourlyRate } = request.data;
+    if (!hourlyRate || typeof hourlyRate !== "number" || hourlyRate < 0) {
+        throw new HttpsError("invalid-argument", "Parameter 'hourlyRate' diperlukan dan harus angka non-negatif.");
+    }
+
+    const db = getFirestore();
+    const pricingRef = db.collection("config").doc("pricing");
+
+    try {
+        // 3. Update dokumen konfigurasi harga.
+        await pricingRef.set({
+            hourly_rate: hourlyRate,
+            last_updated_by: request.auth.token.email,
+            last_updated_at: Timestamp.now()
+        }, { merge: true }); // Gunakan merge untuk update, bukan menimpa seluruh dokumen.
+
+        const logDetails = `Admin mengubah tarif per jam menjadi Rp${hourlyRate}.`;
+        logger.info(logDetails);
+
+        // 4. Catat aktivitas ini di log admin.
+        await createLogEntry({
+            timestamp: Timestamp.now(),
+            adminId: request.auth.uid,
+            adminEmail: request.auth.token.email,
+            action: "SET_PRICING",
+            details: logDetails,
+            targetId: "pricing",
+            targetType: "CONFIG"
+        });
+
+        // 5. Kirim pesan sukses kembali.
+        return {
+            success: true,
+            message: `Tarif harga berhasil diubah menjadi Rp${hourlyRate} per jam.`,
+        };
+    } catch (error) {
+        logger.error("Gagal mengubah tarif harga oleh admin:", error);
         throw new HttpsError("internal", "Terjadi kesalahan di server.");
     }
 });
@@ -1312,458 +2053,3 @@ exports.reportSuspiciousMotion = onRequest(async (request, response) => {
     }
 });
 
-/**
- * Cloud Function untuk menetapkan custom claim 'admin' ke seorang pengguna.
- * Hanya bisa dipanggil oleh admin yang sudah ada.
- * Memerlukan data: { email: string }
- */
-exports.addAdminRole = onCall({ region: "asia-southeast2" }, async (request) => {
-    // 1. Verifikasi bahwa yang memanggil fungsi ini adalah admin
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError(
-            "permission-denied",
-            "Hanya admin yang bisa menambahkan admin baru."
-        );
-    }
-
-    // 2. Dapatkan email dari data yang dikirim dan setel claim
-    const email = request.data.email;
-    try {
-        const user = await admin.auth().getUserByEmail(email); // Menggunakan admin SDK
-        await admin.auth().setCustomUserClaims(user.uid, { admin: true });
-
-        // 3. Kirim respons sukses
-        return {
-            message: `Sukses! ${email} sekarang telah menjadi admin.`,
-        };
-    } catch (error) {
-        logger.error("Gagal menambahkan admin baru:", error);
-        throw new HttpsError("internal", "Gagal menetapkan peran admin.");
-    }
-});
-
-/**
- * Cloud Function untuk admin mereset PIN sebuah loker.
- * FUNGSI INI TELAH DIPERBAIKI dengan logika enkripsi AES.
- * Memerlukan data: { lockerId: string }
- */
-exports.resetLockerPinByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // 1. Verifikasi bahwa yang memanggil fungsi ini adalah admin (Logika Anda sudah benar)
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError(
-            "permission-denied",
-            "Hanya admin yang bisa menjalankan fungsi ini."
-        );
-    }
-
-    const { lockerId } = request.data;
-    if (!lockerId) {
-        throw new HttpsError("invalid-argument", "lockerId harus disediakan.");
-    }
-
-    try {
-        // 2. Logika untuk mereset PIN
-        // Cari dokumen rental yang aktif untuk loker ini.
-        // KOREKSI: Status yang benar adalah 'active', 'locked_due_to_fine', atau 'pending_retrieval'.
-        const rentalsRef = db.collection("rentals");
-        const querySnapshot = await rentalsRef
-            .where("locker_id", "==", lockerId)
-            .where("status", "in", ["active", "locked_due_to_fine", "pending_retrieval"])
-            .limit(1)
-            .get();
-
-        if (querySnapshot.empty) {
-            throw new HttpsError("not-found", `Tidak ada sewa yang dapat direset untuk loker ${lockerId}.`);
-        }
-
-        const rentalDoc = querySnapshot.docs[0];
-        const newPin = Math.floor(1000 + Math.random() * 9000).toString(); // Generate 4 digit PIN baru
-
-        // --- KOREKSI LOGIKA ENKRIPSI DIMULAI DI SINI ---
-
-        // Panggil fungsi 'encrypt' yang sudah Anda buat untuk mengenkripsi PIN baru.
-        // Ini adalah inti dari penerapan keamanan AES Anda.
-        const encryptedNewPin = encrypt(newPin);
-        logger.info(`PIN baru untuk Loker ${lockerId} adalah ${newPin}. Versi terenkripsi dibuat.`);
-
-        // Dapatkan referensi ke dokumen loker yang sesuai.
-        const lockerRef = db.collection("lockers").doc(lockerId);
-
-        // Gunakan Promise.all untuk menjalankan kedua update secara bersamaan.
-        // Ini memastikan konsistensi data antara rental dan loker.
-        await Promise.all([
-            // Update dokumen rental dengan PIN yang sudah dienkripsi.
-            // Ini yang akan dilihat oleh pengguna di aplikasi.
-            rentalDoc.ref.update({ encrypted_pin: encryptedNewPin }),
-
-            // Update dokumen loker dengan PIN teks biasa (plain text).
-            // Ini yang akan dibaca dan divalidasi oleh hardware ESP32.
-            lockerRef.update({ active_pin: newPin })
-        ]);
-
-        // --- AKHIR KOREKSI ---
-
-        // 3. Panggil helper function untuk MENCATAT LOG (Logika Anda sudah benar)
-        await createLogEntry({
-            timestamp: Timestamp.now(),
-            adminId: request.auth.uid,
-            adminEmail: request.auth.token.email,
-            action: "RESET_PIN",
-            details: `Admin mereset PIN untuk Loker ${lockerId}.`,
-            targetId: lockerId,
-            targetType: "LOCKER"
-        });
-
-        // 4. Kirim respons sukses
-        return {
-            success: true,
-            message: `PIN untuk loker ${lockerId} berhasil direset.`,
-            newPin: newPin // Kirim PIN baru (plain text) ke admin untuk keadaan darurat
-        };
-    } catch (error) {
-        logger.error("Gagal mereset PIN oleh admin:", error);
-        if (error instanceof HttpsError) {
-            throw error;
-        }
-        throw new HttpsError("internal", "Terjadi kesalahan di server.");
-    }
-});
-
-/**
- * Cloud Function untuk mengambil daftar log aktivitas admin.
- * Diurutkan dari yang terbaru.
- */
-exports.getAdminLogs = onCall({ region: "asia-southeast2" }, async (request) => {
-    // Verifikasi bahwa yang memanggil fungsi ini adalah admin
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError(
-            "permission-denied",
-            "Hanya admin yang bisa melihat log aktivitas."
-        );
-    }
-
-    try {
-        const logsRef = db.collection("logs");
-        const querySnapshot = await logsRef
-            .orderBy("timestamp", "desc") // Urutkan dari yang paling baru
-            .limit(50) // Batasi 50 log terbaru untuk awal
-            .get();
-
-        const logs = [];
-        querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            logs.push({
-                id: doc.id,
-                ...data,
-                // Konversi timestamp ke format yang lebih mudah dibaca di klien
-                timestamp: data.timestamp.toDate().toISOString()
-            });
-        });
-
-        return { logs };
-    } catch (error) {
-        logger.error("Gagal mengambil log admin:", error);
-        throw new HttpsError("internal", "Gagal mengambil data log.");
-    }
-});
-
-/**
- * (API untuk Admin) - Mengambil daftar semua riwayat sewa (rentals).
- * Diurutkan dari yang terbaru, dengan batasan jumlah untuk performa.
- */
-exports.getAllRentalsByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // Langkah 1: Verifikasi bahwa pemanggil adalah admin.
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
-    }
-
-    try {
-        // Langkah 2: Query ke koleksi 'rentals'.
-        const rentalsRef = db.collection("rentals");
-        const querySnapshot = await rentalsRef
-            .orderBy("start_time", "desc") // Urutkan berdasarkan waktu mulai, yang terbaru di atas.
-            .limit(100) // Batasi 100 data terbaru untuk mencegah overload.
-            .get();
-
-        // Langkah 3: Format data untuk dikirim ke frontend.
-        const rentals = [];
-        querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            rentals.push({
-                id: doc.id, // Sertakan ID dokumen
-                ...data,
-                // Ubah format timestamp agar mudah dibaca di frontend
-                start_time: data.start_time ? data.start_time.toDate().toISOString() : null,
-                expected_end_time: data.expected_end_time ? data.expected_end_time.toDate().toISOString() : null,
-                actual_end_time: data.actual_end_time ? data.actual_end_time.toDate().toISOString() : null,
-                updated_at: data.updated_at ? data.updated_at.toDate().toISOString() : null,
-            });
-        });
-
-        // Langkah 4: Kirim data kembali.
-        logger.info(`Admin ${request.auth.token.email} mengambil ${rentals.length} data rental.`);
-        return { rentals };
-    } catch (error) {
-        logger.error("Gagal mengambil semua data rental oleh admin:", error);
-        throw new HttpsError("internal", "Gagal mengambil data rental.");
-    }
-});
-
-/**
- * (API untuk Admin) - Mengambil daftar dan status semua loker.
- */
-exports.getAllLockersByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // Langkah 1: Verifikasi bahwa pemanggil adalah admin.
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
-    }
-
-    try {
-        // Langkah 2: Query ke koleksi 'lockers'.
-        const lockersRef = db.collection("lockers");
-        const querySnapshot = await lockersRef.get();
-
-        // Langkah 3: Format data untuk dikirim ke frontend.
-        const lockers = [];
-        querySnapshot.forEach((doc) => {
-            lockers.push({
-                id: doc.id,
-                ...doc.data(),
-            });
-        });
-
-        // Langkah 4: Kirim data kembali.
-        logger.info(`Admin ${request.auth.token.email} mengambil ${lockers.length} data loker.`);
-        return { lockers };
-    } catch (error) {
-        logger.error("Gagal mengambil semua data loker oleh admin:", error);
-        throw new HttpsError("internal", "Gagal mengambil data loker.");
-    }
-});
-
-/**
- * (API untuk Admin) - Mengambil daftar semua pengguna yang terdaftar di sistem.
- * Fungsi ini menggunakan Firebase Authentication API.
- */
-exports.getAllUsersByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
-    }
-
-    try {
-        // Langkah 2: Panggil Admin Auth API untuk mengambil daftar pengguna.
-        // Kita batasi 1000 pengguna pertama untuk performa.
-        // Untuk aplikasi yang lebih besar, perlu implementasi pagination.
-        const listUsersResult = await getAuth().listUsers(1000);
-
-        // Langkah 3: Format data agar lebih mudah digunakan di frontend.
-        // Kita hanya mengambil informasi yang paling relevan.
-        const users = listUsersResult.users.map((userRecord) => {
-            return {
-                uid: userRecord.uid,
-                email: userRecord.email,
-                displayName: userRecord.displayName || "Tidak Ada Nama",
-                photoURL: userRecord.photoURL || null,
-                disabled: userRecord.disabled,
-                creationTime: userRecord.metadata.creationTime,
-                lastSignInTime: userRecord.metadata.lastSignInTime,
-                // Kita juga bisa melihat apakah seorang user adalah admin atau bukan
-                customClaims: userRecord.customClaims || {}
-            };
-        });
-
-        // Langkah 4: Kirim data kembali.
-        logger.info(`Admin ${request.auth.token.email} mengambil ${users.length} data pengguna.`);
-        return { users };
-    } catch (error) {
-        logger.error("Gagal mengambil daftar pengguna oleh admin:", error);
-        throw new HttpsError("internal", "Gagal mengambil data pengguna.");
-    }
-});
-
-/**
- * (API untuk Admin) - Mengambil daftar semua riwayat pembayaran dari semua pengguna.
- * Diurutkan dari yang terbaru.
- */
-exports.getAllPaymentsByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
-    }
-
-    try {
-        // Langkah 2: Query ke koleksi 'payments'.
-        const paymentsRef = db.collection("payments");
-        const querySnapshot = await paymentsRef
-            .orderBy("created_at", "desc") // Urutkan berdasarkan waktu dibuat, yang terbaru di atas.
-            .limit(100) // Batasi 100 data terbaru untuk awal.
-            .get();
-
-        // Langkah 3: Format data untuk dikirim ke frontend.
-        const payments = [];
-        querySnapshot.forEach((doc) => {
-            const data = doc.data();
-            payments.push({
-                id: doc.id, // ID dokumen pembayaran (order_id dari Midtrans)
-                ...data,
-                // Ubah format timestamp agar mudah dibaca di frontend
-                created_at: data.created_at ? data.created_at.toDate().toISOString() : null,
-                updated_at: data.updated_at ? data.updated_at.toDate().toISOString() : null,
-            });
-        });
-
-        // Langkah 4: Kirim data kembali.
-        logger.info(`Admin ${request.auth.token.email} mengambil ${payments.length} data pembayaran.`);
-        return { payments };
-    } catch (error) {
-        logger.error("Gagal mengambil semua data pembayaran oleh admin:", error);
-        throw new HttpsError("internal", "Gagal mengambil data pembayaran.");
-    }
-});
-
-/**
- * (API untuk Admin) - Memicu pengiriman email reset password ke seorang pengguna.
- * FUNGSI INI TELAH DIPERBAIKI untuk mengirim email secara manual.
- */
-exports.resetUserPasswordByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // 1. Verifikasi admin (logika Anda sudah benar)
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
-    }
-
-    const { getAuth } = require("firebase-admin/auth");
-    const email = request.data.email;
-    if (!email || typeof email !== "string") {
-        throw new HttpsError("invalid-argument", "Parameter 'email' diperlukan.");
-    }
-
-    if (!isValidEmail(email)) {
-        logger.error("Invalid email format", { email });
-        throw new HttpsError("invalid-argument", "Format email tidak valid.");
-    }
-
-    try {
-        // --- LANGKAH A: BUAT LINK RESET (seperti sebelumnya) ---
-        const resetLink = await getAuth().generatePasswordResetLink(email);
-        logger.info(`Link reset password berhasil dibuat untuk: ${email}`);
-
-        // --- LANGKAH B: KIRIM EMAIL MENGGUNAKAN NODEMAILER ---
-        // Konfigurasi transporter email menggunakan kredensial dari Secret Manager
-        const transporter = nodemailer.createTransport({
-            service: "gmail",
-            auth: {
-                user: SENDER_EMAIL.value(),
-                pass: SENDER_PASSWORD.value(), // Gunakan App Password di sini
-            },
-        });
-
-        // Konfigurasi isi email
-        const mailOptions = {
-            from: `"SAF-E Locker Admin" <${SENDER_EMAIL.value()}>`,
-            to: email, // Kirim ke email pengguna target
-            subject: "Reset Password untuk Akun SAF-E Locker Anda",
-            html: `
-                <p>Halo,</p>
-                <p>Anda menerima email ini karena ada permintaan reset password untuk akun Anda dari admin.</p>
-                <p>Silakan klik link di bawah ini untuk membuat password baru:</p>
-                <a href="${resetLink}">Reset Password Anda</a>
-                <p>Jika Anda tidak merasa meminta ini, silakan abaikan email ini.</p>
-                <p>Terima kasih,</p>
-                <p>Tim SAF-E Locker</p>
-            `,
-        };
-
-        // Kirim email
-        await transporter.sendMail(mailOptions);
-        logger.info(`Email reset password berhasil dikirim ke ${email}`);
-
-        // Kirim pesan sukses kembali ke antarmuka admin
-        return {
-            success: true,
-            message: `Email reset password telah berhasil dikirim ke ${email}.`,
-        };
-    } catch (error) {
-        logger.error(`Gagal memproses reset password untuk ${email}:`, error);
-        if (error.code === "auth/user-not-found") {
-            throw new HttpsError("not-found", `Pengguna dengan email ${email} tidak ditemukan.`);
-        }
-        throw new HttpsError("internal", "Terjadi kesalahan di server.");
-    }
-});
-
-/**
- * (API untuk Admin) - Mengubah status loker antara 'available' dan 'maintenance'.
- * Fungsi ini memiliki pengaman untuk mencegah menonaktifkan loker yang sedang digunakan.
- * Memerlukan data: { lockerId: string, newStatus: 'available' | 'maintenance' }
- */
-exports.toggleLockerStatusByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // Langkah 1: Verifikasi bahwa pemanggil adalah seorang admin.
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
-    }
-
-    // Langkah 2: Validasi input dari request.
-    const { lockerId, newStatus } = request.data;
-    if (!lockerId || !newStatus) {
-        throw new HttpsError("invalid-argument", "Parameter 'lockerId' dan 'newStatus' diperlukan.");
-    }
-    // Pastikan status baru yang dikirim valid.
-    if (!["available", "maintenance"].includes(newStatus)) {
-        throw new HttpsError("invalid-argument", "Nilai 'newStatus' hanya boleh 'available' atau 'maintenance'.");
-    }
-
-    const lockerRef = db.collection("lockers").doc(lockerId);
-
-    try {
-        // Langkah 3: Periksa status loker saat ini sebelum mengubahnya.
-        const lockerDoc = await lockerRef.get();
-        if (!lockerDoc.exists) {
-            throw new HttpsError("not-found", `Loker dengan ID ${lockerId} tidak ditemukan.`);
-        }
-
-        const currentStatus = lockerDoc.data().status;
-
-        // --- INI ADALAH LOGIKA PENGAMAN PENTING ---
-        // Hanya izinkan perubahan jika loker dalam kondisi 'available' atau 'maintenance'.
-        // Ini mencegah admin menonaktifkan loker yang sedang 'occupied', 'locked_due_to_fine', dll.
-        if (currentStatus !== "available" && currentStatus !== "maintenance") {
-            throw new HttpsError(
-                "failed-precondition",
-                `Loker sedang digunakan (status: ${currentStatus}) dan tidak dapat diubah statusnya.`
-            );
-        }
-
-        // Langkah 4: Jika aman, update status loker.
-        await lockerRef.update({
-            status: newStatus,
-            last_updated: Timestamp.now()
-        });
-
-        const logDetails = `Admin mengubah status Loker ${lockerId} menjadi '${newStatus}'.`;
-        logger.info(logDetails);
-
-        // Langkah 5: Catat aktivitas ini di log admin.
-        await createLogEntry({
-            timestamp: Timestamp.now(),
-            adminId: request.auth.uid,
-            adminEmail: request.auth.token.email,
-            action: "TOGGLE_LOCKER_STATUS",
-            details: logDetails,
-            targetId: lockerId,
-            targetType: "LOCKER"
-        });
-
-        // Langkah 6: Kirim pesan sukses kembali.
-        return {
-            success: true,
-            message: `Status untuk loker ${lockerId} berhasil diubah menjadi '${newStatus}'.`,
-        };
-    } catch (error) {
-        logger.error(`Gagal mengubah status loker ${lockerId} oleh admin:`, error);
-        if (error instanceof HttpsError) {
-            throw error;
-        }
-        throw new HttpsError("internal", "Terjadi kesalahan di server.");
-    }
-});
