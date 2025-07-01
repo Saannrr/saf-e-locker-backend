@@ -218,12 +218,6 @@ exports.initiateRental = onCall({ region: "asia-southeast2" }, async (request) =
                 fine_amount: 0,
             });
 
-            // Reservasi loker
-            t.update(lockerRef, {
-                status: "reserved",
-                current_rental_id: rentalRef.id
-            });
-
             return rentalRef.id;
         });
 
@@ -523,7 +517,7 @@ exports.getPaymentHistory = onCall({ region: "asia-southeast2" }, async (request
                 payment_type: data.payment_type,
                 status: data.status,
                 // Ubah format timestamp agar mudah dibaca di frontend
-                created_at: data.created_at ? data.created_at.toDate().toISOString() : null,
+                created_at: data.created_at || admin.firestore.FieldValue.serverTimestamp(),
             });
         });
 
@@ -848,6 +842,45 @@ exports.getAllPaymentsByAdmin = onCall({ region: "asia-southeast2" }, async (req
     } catch (error) {
         logger.error("Gagal mengambil semua data pembayaran oleh admin:", error);
         throw new HttpsError("internal", "Gagal mengambil data pembayaran.");
+    }
+});
+
+/**
+ * (API untuk Admin) - Mengambil data konfigurasi aplikasi saat ini,
+ * seperti tarif harga sewa.
+ * Tidak memerlukan parameter.
+ */
+exports.getConfigByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa pemanggil adalah seorang admin.
+    if (request.auth.token.admin !== true) {
+        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+    }
+
+    const db = getFirestore();
+    const pricingRef = db.collection("config").doc("pricing");
+
+    try {
+        // 2. Ambil dokumen konfigurasi harga.
+        const pricingDoc = await pricingRef.get();
+
+        if (!pricingDoc.exists) {
+            throw new HttpsError("not-found", "Dokumen konfigurasi harga tidak ditemukan.");
+        }
+
+        const configData = pricingDoc.data();
+        logger.info(`Admin ${request.auth.token.email} berhasil mengambil data konfigurasi.`);
+
+        // 3. Kirim data konfigurasi kembali.
+        return {
+            success: true,
+            config: configData
+        };
+    } catch (error) {
+        logger.error("Gagal mengambil data konfigurasi oleh admin:", error);
+        if (error instanceof HttpsError) {
+            throw error;
+        }
+        throw new HttpsError("internal", "Terjadi kesalahan di server.");
     }
 });
 
@@ -1290,13 +1323,26 @@ exports.createTransaction = onCall({ enforceAppCheck: false }, async (request) =
         transactionAmount = rentalData.initial_cost;
         logger.info(`Membuat transaksi sewa awal untuk rental ${rentalId} sebesar Rp${transactionAmount} (diambil dari server).`);
     } else if (paymentType === "extension_fee") {
-        // --- KOREKSI DI SINI ---
-        // Gunakan variabel 'amountFromRequest' yang sudah kita deklarasikan.
-        if (!amountFromRequest || typeof amountFromRequest !== "number" || amountFromRequest <= 0) {
-            throw new HttpsError("invalid-argument", "Parameter 'amount' diperlukan dan harus angka positif untuk perpanjangan.");
+        // --- PERUBAHAN UTAMA DIMULAI DI SINI ---
+
+        // 1. Validasi input 'extensionInHours' dari client
+        if (!extensionInHours || typeof extensionInHours !== "number" || extensionInHours <= 0) {
+            throw new HttpsError("invalid-argument", "Untuk perpanjangan, 'extensionInHours' harus angka positif.");
         }
-        transactionAmount = amountFromRequest;
-        // --- AKHIR KOREKSI ---
+
+        // 2. Ambil harga per jam (hourly_rate) terbaru dari database
+        const pricingRef = db.collection("config").doc("pricing");
+        const pricingDoc = await pricingRef.get();
+        if (!pricingDoc.exists || !pricingDoc.data().hourly_rate) {
+            throw new HttpsError("internal", "Konfigurasi harga tidak ditemukan. Hubungi administrator.");
+        }
+        const hourlyRate = pricingDoc.data().hourly_rate;
+
+        // 3. Hitung total biaya di server. Inilah langkah kuncinya.
+        transactionAmount = hourlyRate * extensionInHours;
+
+        logger.info(`Membuat transaksi perpanjangan untuk rental ${rentalId} selama ${extensionInHours} jam dengan tarif Rp${hourlyRate}/jam. Total: Rp${transactionAmount}`);
+        // --- AKHIR PERUBAHAN UTAMA ---
     } else if (paymentType === "fine") {
         // Untuk denda, ambil dari Firestore.
         if (!rentalData.fine_amount || rentalData.fine_amount <= 0) {
