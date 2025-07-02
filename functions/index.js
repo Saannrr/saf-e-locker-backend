@@ -780,12 +780,21 @@ exports.getAllUsersByAdmin = onCall({ region: "asia-southeast2" }, async (reques
         // Untuk aplikasi yang lebih besar, perlu implementasi pagination.
         const listUsersResult = await getAuth().listUsers(1000);
 
+        // 3. Ambil semua data 'username' dari koleksi 'users' di Firestore.
+        // Ini lebih efisien daripada query satu per satu.
+        const usersCollection = await db.collection("users").get();
+        const usernames = {}; // Gunakan Map untuk lookup cepat
+        usersCollection.forEach((doc) => {
+            usernames[doc.id] = doc.data().username;
+        });
+
         // Langkah 3: Format data agar lebih mudah digunakan di frontend.
         // Kita hanya mengambil informasi yang paling relevan.
         const users = listUsersResult.users.map((userRecord) => {
             return {
                 uid: userRecord.uid,
                 email: userRecord.email,
+                username: usernames[userRecord.uid] || "Belum diatur",
                 displayName: userRecord.displayName || "Tidak Ada Nama",
                 photoURL: userRecord.photoURL || null,
                 disabled: userRecord.disabled,
