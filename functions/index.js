@@ -23,6 +23,7 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { getMessaging } = require("firebase-admin/messaging");
 const { getAuth } = require("firebase-admin/auth");
 const nodemailer = require("nodemailer");
+// const functions = require("firebase-functions");
 
 // Inisialisasi Firebase Admin SDK
 initializeApp();
@@ -533,6 +534,87 @@ exports.getPaymentHistory = onCall({ region: "asia-southeast2" }, async (request
     }
 });
 
+/**
+ * Cloud Function terjadwal (v2) yang berjalan setiap 5 menit.
+ * Fungsi ini memeriksa sewa yang akan berakhir dan mengirimkan notifikasi pengingat.
+ */
+exports.checkRentalDurations = onSchedule(
+    {
+        schedule: "every 5 minutes",
+        region: "asia-southeast2",
+        // Anda bisa menambahkan opsi lain seperti timezone jika diperlukan
+        // timezone: "Asia/Jakarta",
+    },
+    async (event) => {
+        logger.info("Menjalankan pengecekan durasi sewa...");
+
+        const now = new Date();
+        // Tentukan batas waktu: 20 menit dari sekarang
+        const reminderWindow = new Date(now.getTime() + 20 * 60 * 1000);
+
+        // Query untuk mencari sewa yang relevan
+        const rentalsRef = db.collection("rentals");
+        const snapshot = await rentalsRef
+            .where("status", "==", "active")
+            .where("is_reminder_sent", "==", false)
+            .where("expected_end_time", "<=", admin.firestore.Timestamp.fromDate(reminderWindow))
+            .where("expected_end_time", ">", admin.firestore.Timestamp.fromDate(now))
+            .get();
+
+        if (snapshot.empty) {
+            logger.info("Tidak ada sewa yang perlu diingatkan saat ini.");
+            return null;
+        }
+
+        // Proses setiap sewa yang ditemukan
+        const notificationPromises = snapshot.docs.map(async (doc) => {
+            const rental = doc.data();
+            const userId = rental.user_id;
+
+            // Ambil token FCM dari dokumen pengguna
+            const userDoc = await db.collection("users").doc(userId).get();
+            if (!userDoc.exists) {
+                logger.warn(`Dokumen pengguna tidak ditemukan untuk UID: ${userId}`);
+                return;
+            }
+
+            const fcmToken = userDoc.data().fcmToken;
+            if (!fcmToken) {
+                logger.warn(`Token FCM tidak ditemukan untuk pengguna: ${userId}`);
+                return;
+            }
+
+            // Buat payload notifikasi
+            const payload = {
+                notification: {
+                    title: "Sewa Akan Segera Berakhir",
+                    body: `Waktu sewa loker Anda akan segera berakhir. Segera perpanjang atau kosongkan loker.`,
+                },
+                token: fcmToken,
+            };
+
+            try {
+                // Kirim notifikasi
+                logger.info(`Mengirim notifikasi ke pengguna: ${userId}`);
+                await admin.messaging().send(payload);
+
+                // Tandai bahwa notifikasi sudah dikirim untuk mencegah duplikasi
+                await doc.ref.update({ is_reminder_sent: true });
+                logger.info(`Notifikasi berhasil dikirim dan ditandai untuk rental ID: ${doc.id}`);
+            } catch (error) {
+                logger.error(`Gagal mengirim notifikasi ke ${userId}:`, error);
+                if (error.code === "messaging/registration-token-not-registered") {
+                    await userDoc.ref.update({ fcmToken: admin.firestore.FieldValue.delete() });
+                }
+            }
+        });
+
+        await Promise.all(notificationPromises);
+        logger.info("Pengecekan durasi sewa selesai.");
+        return null;
+    }
+);
+
 // --- BAGIAN API UNTUK FRONTEND (Admin) ---
 
 /**
@@ -763,6 +845,63 @@ exports.getAllLockersByAdmin = onCall({ region: "asia-southeast2" }, async (requ
         throw new HttpsError("internal", "Gagal mengambil data loker.");
     }
 });
+
+/**
+ * Cloud Function (v2) untuk mengambil status semua loker.
+ * Endpoint ini akan mengambil data dari koleksi 'lockers' dan
+ * mengubah format field 'isLocked' menjadi 'lidStatus'.
+ *
+ * @returns {Object[]} Array of objects, masing-masing berisi id dan lidStatus.
+ * Contoh: [{ id: "LKR01", lidStatus: "Closed" }, { id: "LKR02", lidStatus: "Open" }]
+ */
+exports.getAllLockerStatus = onRequest(
+    { region: "asia-southeast2" }, // Opsi fungsi, termasuk region
+    async (request, response) => { // Handler dengan (request, response)
+        // Hanya izinkan metode GET
+        if (request.method !== "GET") {
+            response.status(405).json({ error: "Method Not Allowed" });
+            return;
+        }
+
+        try {
+            // Mengambil semua dokumen dari koleksi 'lockers'
+            const lockersSnapshot = await db.collection("lockers").get();
+
+            // Jika koleksi kosong, kirim array kosong
+            if (lockersSnapshot.empty) {
+                logger.info("No lockers found.");
+                response.status(200).json([]);
+                return;
+            }
+
+            // Memproses setiap dokumen untuk mengubah format data
+            const lockersData = lockersSnapshot.docs.map((doc) => {
+                const data = doc.data();
+
+                // Mengubah nilai boolean 'isLocked' menjadi string 'lidStatus'
+                // 'Closed' untuk true, 'Open' untuk false
+                const lidStatus = data.isLocked ? "Closed" : "Open";
+
+                // Mengembalikan objek baru dengan format yang diinginkan
+                return {
+                    id: doc.id, // Menggunakan ID dokumen sebagai ID loker
+                    lidStatus: lidStatus,
+                    // Anda bisa menambahkan field lain jika diperlukan, contoh:
+                    // tariff: data.tariff || 0,
+                    // availability: data.availability || 'Unknown'
+                };
+            });
+
+            // Mengirim data yang sudah diformat sebagai respons JSON
+            logger.info(`Successfully fetched ${lockersData.length} lockers.`);
+            response.status(200).json(lockersData);
+        } catch (error) {
+            // Menangani error jika terjadi masalah saat mengambil data
+            logger.error("Error fetching lockers:", error);
+            response.status(500).json({ error: "Internal Server Error: Unable to fetch locker data." });
+        }
+    }
+);
 
 /**
  * (API untuk Admin) - Mengambil daftar semua pengguna yang terdaftar di sistem.
