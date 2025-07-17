@@ -1067,14 +1067,14 @@ exports.getAllPaymentsByAdmin = onCall({ region: "asia-southeast2" }, async (req
 });
 
 /**
- * (API untuk Admin) - Mengambil data konfigurasi aplikasi saat ini,
- * seperti tarif harga sewa.
+ * (API untuk User & Admin) - Mengambil data konfigurasi harga aplikasi saat ini.
+ * Fungsi ini bisa dipanggil oleh semua pengguna yang sudah login.
  * Tidak memerlukan parameter.
  */
-exports.getConfigByAdmin = onCall({ region: "asia-southeast2" }, async (request) => {
-    // 1. Verifikasi bahwa pemanggil adalah seorang admin.
-    if (request.auth.token.admin !== true) {
-        throw new HttpsError("permission-denied", "Hanya admin yang bisa menjalankan fungsi ini.");
+exports.getPricingConfig = onCall({ region: "asia-southeast2" }, async (request) => {
+    // 1. Verifikasi bahwa pengguna sudah login (tidak harus admin).
+    if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Anda harus login untuk melihat informasi harga.");
     }
 
     const db = getFirestore();
@@ -1085,21 +1085,20 @@ exports.getConfigByAdmin = onCall({ region: "asia-southeast2" }, async (request)
         const pricingDoc = await pricingRef.get();
 
         if (!pricingDoc.exists) {
-            throw new HttpsError("not-found", "Dokumen konfigurasi harga tidak ditemukan.");
+            // Jika dokumen tidak ada, kembalikan error yang jelas.
+            throw new HttpsError("not-found", "Dokumen konfigurasi harga tidak ditemukan. Hubungi administrator.");
         }
 
         const configData = pricingDoc.data();
-        logger.info(`Admin ${request.auth.token.email} berhasil mengambil data konfigurasi.`);
+        logger.info(`Pengguna ${request.auth.uid} berhasil mengambil data harga.`);
 
-        // 3. Kirim data konfigurasi kembali.
-        return {
-            success: true,
-            config: configData
-        };
+        // 3. Langsung kirim data konfigurasi kembali.
+        // Ini lebih sederhana untuk diolah oleh frontend.
+        return configData;
     } catch (error) {
-        logger.error("Gagal mengambil data konfigurasi oleh admin:", error);
+        logger.error("Gagal mengambil data konfigurasi:", error);
         if (error instanceof HttpsError) {
-            throw error;
+            throw error; // Lemparkan kembali error yang sudah kita buat.
         }
         throw new HttpsError("internal", "Terjadi kesalahan di server.");
     }
